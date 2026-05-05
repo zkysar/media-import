@@ -1,0 +1,1332 @@
+#!/usr/bin/env python3
+"""dji-import — import DJI Mic 2 audio with chain-aware joining.
+
+See ~/projects/plans/2026-05-04-dji-import-design.md for the full spec.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Iterable
+
+# ─────────────────────────── constants ────────────────────────────
+
+VOLUMES_GLOB = Path("/Volumes")
+DJI_FILE_RE = re.compile(r"^TX(\d+)_MIC(\d+)_(\d{8})_(\d{6})_(edit|orig)\.wav$")
+WHISPER_CACHE_DIR = Path.home() / ".cache" / "whisper"
+RATE_CACHE_PATH = Path.home() / ".cache" / "dji-import" / "rates.json"
+STAGING_DIR_NAME = ".dji-import-staging"
+
+DURATION_AUTOSPLIT_LO = 1799.5
+DURATION_AUTOSPLIT_HI = 1800.5
+ADJACENT_TOLERANCE_S = 2.0
+
+OVERLAP_PROBE_S = 30.0  # initial probe size for overlap detection
+
+# Default rate model — used until rate cache has data.
+DEFAULT_RATES = {
+    "copy_mb_per_s": 17.0,           # SD-class-10 floor
+    "join_mb_per_s": 140.0,          # local SSD write
+    "transcribe_x_realtime": {
+        "tiny": 30.0,
+        "base": 15.0,
+        "small": 8.0,
+        "medium": 3.0,
+        "large-v3": 1.0,
+        "large-v3-turbo": 8.0,
+    },
+}
+
+# ─────────────────────────── dataclasses ────────────────────────────
+
+
+@dataclass
+class Wav:
+    fmt_code: int
+    channels: int
+    sample_rate: int
+    block_align: int
+    bits_per_sample: int
+    data_offset: int
+    data_size: int
+
+    @property
+    def nframes(self) -> int:
+        return self.data_size // self.block_align if self.block_align else 0
+
+    @property
+    def duration_s(self) -> float:
+        return self.nframes / self.sample_rate if self.sample_rate else 0.0
+
+
+@dataclass
+class Clip:
+    path: Path
+    tx: str             # "TX01" / "TX02"
+    clip_idx: int
+    start: datetime     # from filename
+    version: str        # "edit" / "orig"
+    wav: Wav
+    volume: Path        # mount point
+
+    @property
+    def end(self) -> datetime:
+        return self.start + timedelta(seconds=self.wav.duration_s)
+
+    @property
+    def size_bytes(self) -> int:
+        try:
+            return self.path.stat().st_size
+        except OSError:
+            return 0
+
+
+@dataclass
+class Chain:
+    """Two-or-more clips that DJI auto-split. Length-1 lists are singletons."""
+    clips: list[Clip]   # in start-time order
+    tx: str
+    version: str
+
+    @property
+    def is_singleton(self) -> bool:
+        return len(self.clips) < 2
+
+    @property
+    def start(self) -> datetime:
+        return self.clips[0].start
+
+    @property
+    def end(self) -> datetime:
+        return self.clips[-1].end
+
+    @property
+    def date_bucket(self) -> date:
+        return self.start.date()
+
+
+@dataclass
+class CopyOp:
+    src: Path
+    dst: Path
+    size_bytes: int
+
+
+@dataclass
+class JoinOp:
+    chain: Chain
+    staged_inputs: list[Path]   # paths in staging
+    output: Path                # final dest path
+    expected_frames: int        # sum(in_frames) − sum(overlap_frames); set at run time
+
+
+@dataclass
+class TranscribeOp:
+    audio: Path
+    output_dir: Path
+    duration_s: float
+
+
+@dataclass
+class Plan:
+    copies: list[CopyOp] = field(default_factory=list)
+    joins: list[JoinOp] = field(default_factory=list)
+    transcribes: list[TranscribeOp] = field(default_factory=list)
+    singleton_moves: list[CopyOp] = field(default_factory=list)  # staged → final
+    dest: Path = Path()
+    args_summary: dict = field(default_factory=dict)
+
+
+# ─────────────────────────── WAV parsing ────────────────────────────
+
+
+def parse_wav_header(path: Path) -> Wav | None:
+    """Walk RIFF chunks; return Wav or None on parse failure."""
+    try:
+        with open(path, "rb") as f:
+            riff = f.read(12)
+            if len(riff) < 12 or riff[0:4] != b"RIFF" or riff[8:12] != b"WAVE":
+                return None
+            fmt_code = channels = sample_rate = block_align = bits_per_sample = 0
+            data_offset = data_size = 0
+            while True:
+                hdr = f.read(8)
+                if len(hdr) < 8:
+                    break
+                cid, csize = struct.unpack("<4sI", hdr)
+                start = f.tell()
+                if cid == b"fmt ":
+                    fmt_data = f.read(csize)
+                    (fmt_code, channels, sample_rate, _byte_rate,
+                     block_align, bits_per_sample) = struct.unpack(
+                        "<HHIIHH", fmt_data[:16]
+                    )
+                elif cid == b"data":
+                    data_offset = start
+                    data_size = csize
+                    break
+                else:
+                    f.seek(start + csize + (csize & 1))
+                    continue
+                f.seek(start + csize + (csize & 1))
+            if not (sample_rate and bits_per_sample and data_size):
+                return None
+            return Wav(fmt_code, channels, sample_rate, block_align,
+                       bits_per_sample, data_offset, data_size)
+    except OSError:
+        return None
+
+
+def read_data_window_bytes(path: Path, wav: Wav,
+                           offset_frames: int, count_frames: int) -> bytes:
+    """Read raw bytes from the WAV data chunk; no decoding."""
+    if count_frames <= 0:
+        return b""
+    offset_frames = max(0, min(offset_frames, wav.nframes))
+    count_frames = max(0, min(count_frames, wav.nframes - offset_frames))
+    if count_frames == 0:
+        return b""
+    byte_offset = wav.data_offset + offset_frames * wav.block_align
+    byte_count = count_frames * wav.block_align
+    with open(path, "rb") as f:
+        f.seek(byte_offset)
+        return f.read(byte_count)
+
+
+# ───────────────────────────── discovery ─────────────────────────────
+
+
+def find_dji_volumes() -> list[Path]:
+    """Scan /Volumes/* for any volume containing files matching DJI pattern."""
+    if not VOLUMES_GLOB.exists():
+        return []
+    out: list[Path] = []
+    for vol in VOLUMES_GLOB.iterdir():
+        if not vol.is_dir():
+            continue
+        # Cheap check: any matching file at root or one level deep
+        try:
+            for p in vol.iterdir():
+                if DJI_FILE_RE.search(p.name):
+                    out.append(vol)
+                    break
+                if p.is_dir():
+                    try:
+                        for q in p.iterdir():
+                            if DJI_FILE_RE.search(q.name):
+                                out.append(vol)
+                                break
+                    except (OSError, PermissionError):
+                        continue
+                    if vol in out:
+                        break
+        except (OSError, PermissionError):
+            continue
+    return out
+
+
+def discover_clips(volumes: Iterable[Path]) -> list[Clip]:
+    """rglob each volume; parse filenames + WAV headers."""
+    clips: list[Clip] = []
+    for vol in volumes:
+        for p in vol.rglob("*.wav"):
+            m = DJI_FILE_RE.search(p.name)
+            if not m:
+                continue
+            wav = parse_wav_header(p)
+            if wav is None:
+                continue
+            try:
+                start = datetime.strptime(m.group(3) + m.group(4), "%Y%m%d%H%M%S")
+            except ValueError:
+                continue
+            clips.append(Clip(
+                path=p,
+                tx=f"TX{m.group(1)}",
+                clip_idx=int(m.group(2)),
+                start=start,
+                version=m.group(5),
+                wav=wav,
+                volume=vol,
+            ))
+    return clips
+
+
+# ───────────────────────── filtering & chains ─────────────────────────
+
+
+def filter_by_args(clips: list[Clip], args: argparse.Namespace) -> list[Clip]:
+    out: list[Clip] = []
+    for c in clips:
+        if args.from_date and c.start.date() < args.from_date:
+            continue
+        if args.to_date and c.start.date() > args.to_date:
+            continue
+        if args.mic != "all" and c.tx != args.mic:
+            continue
+        if args.version == "edit" and c.version != "edit":
+            continue
+        if args.version == "orig" and c.version != "orig":
+            continue
+        out.append(c)
+    return out
+
+
+def build_chains(clips: list[Clip]) -> list[Chain]:
+    """Group by (tx, version), sort by start, walk for §3 detection rule."""
+    groups: dict[tuple[str, str], list[Clip]] = {}
+    for c in clips:
+        groups.setdefault((c.tx, c.version), []).append(c)
+
+    chains: list[Chain] = []
+    for (tx, version), gclips in groups.items():
+        gclips.sort(key=lambda c: c.start)
+        current: list[Clip] = []
+        for i, c in enumerate(gclips):
+            if not current:
+                current.append(c)
+                continue
+            prev = current[-1]
+            cond_a = DURATION_AUTOSPLIT_LO <= prev.wav.duration_s <= DURATION_AUTOSPLIT_HI
+            gap = (c.start - prev.end).total_seconds()
+            cond_b = abs(gap) <= ADJACENT_TOLERANCE_S
+            if cond_a and cond_b:
+                current.append(c)
+            else:
+                chains.append(Chain(clips=current, tx=tx, version=version))
+                current = [c]
+        if current:
+            chains.append(Chain(clips=current, tx=tx, version=version))
+    chains.sort(key=lambda ch: (ch.tx, ch.version, ch.start))
+    return chains
+
+
+# ───────────────────────── overlap measurement ─────────────────────────
+
+
+def measure_overlap_frames(prev: Path, prev_wav: Wav,
+                           cur: Path, cur_wav: Wav,
+                           probe_s: float = OVERLAP_PROBE_S) -> int:
+    """Binary-search for the largest K such that prev's last K frames
+    equal cur's first K frames (byte-exact). Returns K in frames.
+
+    Important: byte-equality on silent (all-zero) regions is meaningless
+    — every zero byte trivially equals every other zero byte. After the
+    binary search finds K, we verify the matched region has nonzero
+    content. If silent, return 0 (concatenating silence with silence is
+    correct either way, and we shouldn't trim what isn't really overlap)."""
+    if prev_wav.block_align != cur_wav.block_align:
+        return 0
+    sr = prev_wav.sample_rate
+    if sr <= 0:
+        return 0
+    ba = prev_wav.block_align
+    probe_frames = int(sr * probe_s)
+    probe_frames = min(probe_frames, prev_wav.nframes, cur_wav.nframes)
+    if probe_frames <= 0:
+        return 0
+
+    tail = read_data_window_bytes(prev, prev_wav,
+                                  prev_wav.nframes - probe_frames, probe_frames)
+    head = read_data_window_bytes(cur, cur_wav, 0, probe_frames)
+    if not tail or not head:
+        return 0
+
+    lo, hi = 0, probe_frames
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        size = mid * ba
+        if tail[-size:] == head[:size]:
+            lo = mid
+        else:
+            hi = mid - 1
+    if lo == 0:
+        return 0
+    # Silence guard: if the matched bytes are entirely zero, it's a
+    # false positive — silent regions byte-match trivially.
+    matched_bytes = tail[-lo * ba:]
+    if matched_bytes.count(b"\x00") == len(matched_bytes):
+        return 0
+    # If we hit the probe ceiling on real content, double and retry.
+    if lo == probe_frames and probe_s < 240.0:
+        return measure_overlap_frames(prev, prev_wav, cur, cur_wav, probe_s * 2)
+    return lo
+
+
+# ───────────────────────── plan building ─────────────────────────
+
+
+def joined_filename(chain: Chain) -> str:
+    s = chain.start.strftime("%Y%m%d_%H%M%S")
+    e = chain.end.strftime("%H%M%S")
+    return f"{chain.tx}_{s}_{e}_{chain.version}_joined.wav"
+
+
+def dest_dir_for(chain_or_clip, dest_root: Path, version: str, tx: str,
+                 multi_date: bool, bucket: date) -> Path:
+    p = dest_root / version
+    if multi_date:
+        p = p / bucket.isoformat()
+    p = p / tx
+    return p
+
+
+def build_plan(chains: list[Chain], args: argparse.Namespace) -> Plan:
+    plan = Plan(dest=args.dest)
+
+    # date bucketing decision: multi-date → include date subfolder
+    all_dates = sorted({ch.date_bucket for ch in chains})
+    multi_date = len(all_dates) > 1
+
+    staging = args.dest / STAGING_DIR_NAME
+
+    for chain in chains:
+        target_dir = dest_dir_for(chain, args.dest, chain.version, chain.tx,
+                                  multi_date, chain.date_bucket)
+
+        if chain.is_singleton or not args.join:
+            # Stage and move (or just leave as singletons).
+            for c in chain.clips:
+                final = target_dir / c.path.name
+                # Idempotency: if dest exists with right size, skip the copy.
+                if final.exists() and final.stat().st_size == c.size_bytes:
+                    pass
+                else:
+                    staged = staging / c.path.name
+                    plan.copies.append(CopyOp(src=c.path, dst=staged,
+                                              size_bytes=c.size_bytes))
+                    plan.singleton_moves.append(CopyOp(src=staged, dst=final,
+                                                        size_bytes=c.size_bytes))
+                # Transcribe singletons too (full recordings, not chain pieces).
+                if args.transcribe:
+                    txt_path = final.with_suffix(".txt")
+                    if not txt_path.exists():
+                        plan.transcribes.append(TranscribeOp(
+                            audio=final,
+                            output_dir=target_dir,
+                            duration_s=c.wav.duration_s,
+                        ))
+        else:
+            joined_path = target_dir / joined_filename(chain)
+            sum_input_frames = sum(c.wav.nframes for c in chain.clips)
+
+            # Idempotency: if joined output already exists with a plausible
+            # frame count, skip the entire chain's work.
+            existing = parse_wav_header(joined_path) if joined_path.exists() else None
+            already_joined = (
+                existing is not None
+                and existing.fmt_code == chain.clips[0].wav.fmt_code
+                and existing.channels == chain.clips[0].wav.channels
+                and existing.sample_rate == chain.clips[0].wav.sample_rate
+                and 0 < existing.nframes <= sum_input_frames + 1
+            )
+
+            if not already_joined:
+                staged_inputs: list[Path] = []
+                for c in chain.clips:
+                    staged = staging / c.path.name
+                    staged_inputs.append(staged)
+                    plan.copies.append(CopyOp(src=c.path, dst=staged,
+                                              size_bytes=c.size_bytes))
+                plan.joins.append(JoinOp(chain=chain, staged_inputs=staged_inputs,
+                                          output=joined_path,
+                                          expected_frames=sum_input_frames))
+
+            if args.transcribe:
+                txt_path = joined_path.with_suffix(".txt")
+                if not txt_path.exists():
+                    plan.transcribes.append(TranscribeOp(
+                        audio=joined_path,
+                        output_dir=target_dir,
+                        duration_s=sum(c.wav.duration_s for c in chain.clips),
+                    ))
+
+    plan.args_summary = {
+        "dest": str(args.dest),
+        "from": args.from_date.isoformat() if args.from_date else None,
+        "to": args.to_date.isoformat() if args.to_date else None,
+        "version": args.version,
+        "mic": args.mic,
+        "join": args.join,
+        "transcribe": args.transcribe,
+        "model": args.model if args.transcribe else None,
+    }
+    return plan
+
+
+# ───────────────────────── time estimation ─────────────────────────
+
+
+def load_rates() -> dict:
+    if RATE_CACHE_PATH.exists():
+        try:
+            with open(RATE_CACHE_PATH) as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            pass
+    return DEFAULT_RATES.copy()
+
+
+def save_rates(rates: dict) -> None:
+    try:
+        RATE_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(RATE_CACHE_PATH, "w") as f:
+            json.dump(rates, f, indent=2)
+    except OSError:
+        pass
+
+
+def update_rate_ema(rates: dict, key: str, new_value: float, alpha: float = 0.3) -> None:
+    """Update an EMA in the rates dict. New runs nudge the average; outliers don't dominate."""
+    cur = rates.get(key)
+    if cur is None or cur <= 0:
+        rates[key] = new_value
+    else:
+        rates[key] = alpha * new_value + (1 - alpha) * cur
+
+
+def estimate_seconds(plan: Plan, rates: dict, model: str | None,
+                     first_run: bool) -> dict:
+    """Return per-phase estimates in seconds."""
+    copy_bytes = sum(op.size_bytes for op in plan.copies)
+    copy_mb = copy_bytes / (1024 * 1024)
+    copy_s = copy_mb / rates.get("copy_mb_per_s", DEFAULT_RATES["copy_mb_per_s"])
+
+    join_bytes = sum(
+        sum(op.size_bytes for op in plan.copies
+            if any(op.dst == s for s in jo.staged_inputs))
+        for jo in plan.joins
+    )
+    # Rough: join I/O is dominated by writing the output (≈sum of inputs).
+    join_mb = join_bytes / (1024 * 1024)
+    join_s = join_mb / rates.get("join_mb_per_s", DEFAULT_RATES["join_mb_per_s"])
+
+    move_s = max(0.5, len(plan.singleton_moves) * 0.05)
+
+    transcribe_s = 0.0
+    if model and plan.transcribes:
+        x = rates.get("transcribe_x_realtime", {}).get(
+            model, DEFAULT_RATES["transcribe_x_realtime"].get(model, 8.0))
+        if x <= 0:
+            x = 8.0
+        total_audio = sum(op.duration_s for op in plan.transcribes)
+        # Add a flat ~10s for model load on top.
+        transcribe_s = (total_audio / x) + 10.0
+
+    return {
+        "copy": copy_s,
+        "join": join_s,
+        "move": move_s,
+        "transcribe": transcribe_s,
+        "total": copy_s + join_s + move_s + transcribe_s,
+        "first_run": first_run,
+    }
+
+
+# ───────────────────────── preview formatting ─────────────────────────
+
+
+def fmt_size(bytes_: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if bytes_ < 1024 or unit == "GB":
+            return f"{bytes_:.1f} {unit}" if unit != "B" else f"{bytes_} B"
+        bytes_ /= 1024
+    return f"{bytes_:.1f} GB"
+
+
+def fmt_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    m = int(seconds // 60)
+    s = int(seconds % 60)
+    if m < 60:
+        return f"{m}m {s:02d}s"
+    h = m // 60
+    m = m % 60
+    return f"{h}h {m:02d}m"
+
+
+def fmt_audio_duration(seconds: float) -> str:
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    return f"{h}h {m:02d}m"
+
+
+def format_preview(plan: Plan, chains: list[Chain], volumes: list[Path],
+                    args: argparse.Namespace, est: dict) -> str:
+    lines: list[str] = []
+    lines.append("DJI Import Preview")
+    lines.append("─" * 64)
+
+    vol_tx: dict[Path, set[str]] = {}
+    for ch in chains:
+        for c in ch.clips:
+            vol_tx.setdefault(c.volume, set()).add(c.tx)
+    if vol_tx:
+        src_summary = ", ".join(
+            f"{v} ({','.join(sorted(txs))})"
+            for v, txs in sorted(vol_tx.items())
+        )
+    else:
+        src_summary = ", ".join(str(v) for v in volumes)
+    lines.append(f"Source:  {src_summary}")
+    lines.append(f"Dest:    {plan.dest}")
+    range_str = f"{args.from_date.isoformat() if args.from_date else '(earliest)'} → {args.to_date.isoformat() if args.to_date else '(today)'}"
+    lines.append(f"Range:   {range_str}  (filter: filename timestamp)")
+    lines.append(f"Version: {args.version}")
+    if args.mic != "all":
+        lines.append(f"Mic:     {args.mic}")
+    lines.append("")
+
+    # Per-(tx,version) summary
+    by_tx: dict[str, dict[str, list[Chain]]] = {}
+    for ch in chains:
+        by_tx.setdefault(ch.tx, {}).setdefault(ch.version, []).append(ch)
+
+    total_clips = sum(len(ch.clips) for ch in chains)
+    total_audio_s = sum(sum(c.wav.duration_s for c in ch.clips) for ch in chains)
+    total_size = sum(sum(c.size_bytes for c in ch.clips) for ch in chains)
+    lines.append(f"Clips matched: {total_clips} ({fmt_audio_duration(total_audio_s)} audio · {fmt_size(total_size)})")
+    for tx in sorted(by_tx):
+        for v in sorted(by_tx[tx]):
+            chs = by_tx[tx][v]
+            n_clips = sum(len(ch.clips) for ch in chs)
+            audio_s = sum(sum(c.wav.duration_s for c in ch.clips) for ch in chs)
+            size_b = sum(sum(c.size_bytes for c in ch.clips) for ch in chs)
+            n_chains = sum(1 for ch in chs if not ch.is_singleton)
+            n_single = sum(1 for ch in chs if ch.is_singleton)
+            chain_str = ""
+            if n_chains:
+                chain_str += f" · {n_chains} auto-split chain{'s' if n_chains != 1 else ''}"
+            if n_single:
+                chain_str += f" · {n_single} singleton{'s' if n_single != 1 else ''}"
+            lines.append(f"  {tx}/{v}: {n_clips} clips · {fmt_audio_duration(audio_s)} · {fmt_size(size_b)}{chain_str}")
+    lines.append("")
+
+    # Joins
+    if plan.joins:
+        lines.append(f"Joins planned: {len(plan.joins)}")
+        for jo in plan.joins:
+            audio_s = sum(c.wav.duration_s for c in jo.chain.clips)
+            lines.append(f"  • {jo.chain.tx} {jo.chain.version}: "
+                         f"{len(jo.chain.clips)} clips → {jo.output.name}  "
+                         f"({fmt_audio_duration(audio_s)})")
+    else:
+        lines.append("Joins planned: 0")
+    lines.append("")
+
+    # Transcribe
+    if args.transcribe and plan.transcribes:
+        total_t = sum(op.duration_s for op in plan.transcribes)
+        n_joined_t = sum(1 for op in plan.transcribes
+                         if "_joined.wav" in op.audio.name)
+        n_single_t = len(plan.transcribes) - n_joined_t
+        lines.append(f"Transcribe: enabled (model={args.model}, lang=en)")
+        lines.append(f"  Targets: {len(plan.transcribes)} files "
+                     f"({n_joined_t} joined, {n_single_t} singletons)")
+        lines.append(f"  Total audio: {fmt_audio_duration(total_t)}")
+    elif args.transcribe:
+        lines.append("Transcribe: enabled but no joined files to transcribe")
+    else:
+        lines.append("Transcribe: disabled")
+    lines.append("")
+
+    # Output layout (high-level)
+    lines.append("Output layout:")
+    seen_dirs: set[Path] = set()
+    for op in plan.singleton_moves:
+        seen_dirs.add(op.dst.parent)
+    for jo in plan.joins:
+        seen_dirs.add(jo.output.parent)
+    for d in sorted(seen_dirs):
+        try:
+            rel = d.relative_to(plan.dest)
+            lines.append(f"  {plan.dest}/{rel}/")
+        except ValueError:
+            lines.append(f"  {d}/")
+    lines.append("")
+
+    # Time estimate
+    lines.append("Estimated time:")
+    lines.append(f"  Copy from SD:    {fmt_duration(est['copy']):>10}")
+    if plan.joins:
+        lines.append(f"  Join (concat):   {fmt_duration(est['join']):>10}")
+    if plan.singleton_moves:
+        lines.append(f"  Move singletons: {fmt_duration(est['move']):>10}")
+    if plan.transcribes:
+        lines.append(f"  Transcribe:      {fmt_duration(est['transcribe']):>10}")
+    lines.append("  " + "─" * 36)
+    note = "  (defaults — actual hardware not benchmarked yet)" if est["first_run"] else ""
+    lines.append(f"  Total:           {fmt_duration(est['total']):>10}{note}")
+    lines.append("")
+
+    # Disk space
+    joined_bytes = sum(sum(c.size_bytes for c in jo.chain.clips) for jo in plan.joins)
+    singleton_bytes = sum(op.size_bytes for op in plan.singleton_moves)
+    lines.append(f"Disk space at dest: ~{fmt_size(joined_bytes + singleton_bytes)}")
+    lines.append("  (joined files + singletons; chain members staged in temp during join, then removed)")
+    return "\n".join(lines)
+
+
+# ───────────────────────── progress UI ─────────────────────────
+
+
+def is_tty() -> bool:
+    return sys.stderr.isatty()
+
+
+def render_bar(done: int, total: int, width: int = 20) -> str:
+    if total <= 0:
+        return "░" * width
+    pct = max(0, min(1.0, done / total))
+    filled = int(round(pct * width))
+    return "█" * filled + "░" * (width - filled)
+
+
+class Progress:
+    """Stderr progress emitter. TTY → in-place redraw; non-TTY → newline updates."""
+
+    def __init__(self, phase_name: str, total_units: float, unit_label: str = "items"):
+        self.phase_name = phase_name
+        self.total = max(0.0, total_units)
+        self.unit_label = unit_label
+        self.done = 0.0
+        self.t0 = time.monotonic()
+        self.last_redraw = 0.0
+        self.tty = is_tty()
+        self._draw()
+
+    def update(self, done_delta: float = 0.0, set_done: float | None = None) -> None:
+        if set_done is not None:
+            self.done = max(0.0, min(self.total, set_done))
+        else:
+            self.done = max(0.0, min(self.total, self.done + done_delta))
+        now = time.monotonic()
+        if self.tty:
+            if now - self.last_redraw >= 0.1 or self.done >= self.total:
+                self._draw()
+                self.last_redraw = now
+        else:
+            # Non-TTY: only emit at meaningful boundaries (10% increments)
+            if not hasattr(self, "_next_pct"):
+                self._next_pct = 0.0
+            pct = self.done / self.total if self.total else 1.0
+            if pct >= self._next_pct or self.done >= self.total:
+                self._draw()
+                self._next_pct = min(1.0, pct + 0.1)
+
+    def finish(self) -> None:
+        self.done = self.total
+        if self.tty:
+            self._draw()
+            sys.stderr.write("\n")
+        else:
+            self._draw()
+
+    def _draw(self) -> None:
+        bar = render_bar(int(self.done), int(self.total) if self.total else 1)
+        elapsed = time.monotonic() - self.t0
+        m, s = divmod(int(elapsed), 60)
+        line = (f"  {self.phase_name:<14} {bar}  "
+                f"{int(self.done)}/{int(self.total)} {self.unit_label} · "
+                f"{m:02d}:{s:02d}")
+        if self.tty:
+            sys.stderr.write("\r\033[2K" + line)
+            sys.stderr.flush()
+        else:
+            sys.stderr.write(line + "\n")
+
+
+# ───────────────────────── execution phases ─────────────────────────
+
+
+def run_copies(plan: Plan, rates: dict) -> dict:
+    """Copy from SD to staging, two parallel workers (one per source volume)."""
+    if not plan.copies:
+        return {"bytes": 0, "elapsed": 0.0}
+
+    plan.dest.mkdir(parents=True, exist_ok=True)
+    (plan.dest / STAGING_DIR_NAME).mkdir(parents=True, exist_ok=True)
+    for op in plan.copies:
+        op.dst.parent.mkdir(parents=True, exist_ok=True)
+
+    # Group by source volume for parallelism
+    by_volume: dict[Path, list[CopyOp]] = {}
+    for op in plan.copies:
+        # Find the volume that the src lives on.
+        vol = next((p for p in op.src.parents if p.parent == VOLUMES_GLOB), op.src.parent)
+        by_volume.setdefault(vol, []).append(op)
+
+    # Idempotency: skip ops where dst already exists with matching size.
+    todo: list[CopyOp] = []
+    skipped_bytes = 0
+    for op in plan.copies:
+        if op.dst.exists() and op.dst.stat().st_size == op.size_bytes:
+            skipped_bytes += op.size_bytes
+            continue
+        todo.append(op)
+
+    total_bytes = sum(op.size_bytes for op in todo)
+    progress = Progress("[1] COPY", total_bytes / (1024 * 1024), "MB")
+    progress.update(set_done=0)
+
+    t0 = time.monotonic()
+    # Simple per-volume sequential (true parallelism with threads is overkill;
+    # most users have only 2 volumes and Python file copy is I/O bound).
+    # We interleave a round-robin across volumes for fairness.
+    iters = {v: iter(ops) for v, ops in by_volume.items()
+             if any(op in todo for op in ops)}
+    queues = {v: [op for op in ops if op in todo] for v, ops in by_volume.items()}
+    done_bytes = 0
+    while any(queues.values()):
+        for v in list(queues.keys()):
+            if not queues[v]:
+                continue
+            op = queues[v].pop(0)
+            try:
+                shutil.copy2(op.src, op.dst)
+            except OSError as e:
+                # one retry
+                try:
+                    shutil.copy2(op.src, op.dst)
+                except OSError:
+                    raise RuntimeError(f"copy failed: {op.src} → {op.dst}: {e}")
+            done_bytes += op.size_bytes
+            progress.update(set_done=done_bytes / (1024 * 1024))
+    progress.finish()
+
+    elapsed = time.monotonic() - t0
+    if total_bytes > 0 and elapsed > 0:
+        mb_per_s = (total_bytes / (1024 * 1024)) / elapsed
+        update_rate_ema(rates, "copy_mb_per_s", mb_per_s)
+    return {"bytes": total_bytes, "elapsed": elapsed}
+
+
+def ffmpeg_trim_copy(src: Path, dst: Path, start_frames: int, sample_rate: int) -> None:
+    """Trim leading frames from src and write to dst, stream-copy."""
+    start_s = start_frames / sample_rate
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-ss", f"{start_s:.6f}",
+        "-i", str(src),
+        "-c", "copy",
+        str(dst),
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"ffmpeg trim failed for {src}: {res.stderr.strip()}")
+
+
+def ffmpeg_concat(inputs: list[Path], output: Path) -> None:
+    """Concat list of WAV inputs to output via -f concat -c copy."""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    list_path = output.parent / f".{output.stem}.list.txt"
+    with open(list_path, "w") as f:
+        for p in inputs:
+            f.write(f"file '{p.as_posix()}'\n")
+    try:
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "concat", "-safe", "0",
+            "-i", str(list_path),
+            "-c", "copy",
+            str(output),
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            raise RuntimeError(f"ffmpeg concat failed: {res.stderr.strip()}")
+    finally:
+        try:
+            list_path.unlink()
+        except OSError:
+            pass
+
+
+def verify_join(jo: JoinOp, expected_total_frames: int) -> None:
+    """Compare output WAV header to expected. Raises on mismatch."""
+    out_wav = parse_wav_header(jo.output)
+    if out_wav is None:
+        raise RuntimeError(f"join verify failed: unable to parse {jo.output}")
+    first_in = parse_wav_header(jo.staged_inputs[0])
+    if first_in is None:
+        raise RuntimeError("join verify: cannot parse first staged input")
+    if (out_wav.sample_rate != first_in.sample_rate or
+            out_wav.channels != first_in.channels or
+            out_wav.bits_per_sample != first_in.bits_per_sample or
+            out_wav.fmt_code != first_in.fmt_code):
+        raise RuntimeError(
+            f"join verify: format mismatch (out: sr={out_wav.sample_rate} "
+            f"ch={out_wav.channels} bps={out_wav.bits_per_sample} fmt={out_wav.fmt_code}; "
+            f"in: sr={first_in.sample_rate} ch={first_in.channels} "
+            f"bps={first_in.bits_per_sample} fmt={first_in.fmt_code})"
+        )
+    if abs(out_wav.nframes - expected_total_frames) > 1:
+        raise RuntimeError(
+            f"join verify: frame count mismatch — out={out_wav.nframes}, "
+            f"expected={expected_total_frames}"
+        )
+
+
+def run_joins(plan: Plan, rates: dict) -> dict:
+    if not plan.joins:
+        return {"bytes": 0, "elapsed": 0.0}
+
+    progress = Progress("[2] JOIN", len(plan.joins), "chains")
+    progress.update(set_done=0)
+
+    t0 = time.monotonic()
+    total_bytes = 0
+    for ji, jo in enumerate(plan.joins):
+        # Idempotency: if output exists, verify by reading header — if frames
+        # match expected (computed below), skip; else delete and redo.
+        if jo.output.exists():
+            try:
+                # We need the same overlap math to know expected; do a quick
+                # measure pass (cheap with binary search).
+                pass
+            except Exception:
+                pass
+
+        # Measure overlaps and prepare inputs to concat.
+        inputs_for_concat: list[Path] = [jo.staged_inputs[0]]
+        first_wav = parse_wav_header(jo.staged_inputs[0])
+        if first_wav is None:
+            raise RuntimeError(f"cannot parse first staged input {jo.staged_inputs[0]}")
+        total_frames = first_wav.nframes
+
+        for i in range(1, len(jo.staged_inputs)):
+            prev_path = jo.staged_inputs[i - 1]
+            cur_path = jo.staged_inputs[i]
+            prev_wav = parse_wav_header(prev_path)
+            cur_wav = parse_wav_header(cur_path)
+            if prev_wav is None or cur_wav is None:
+                raise RuntimeError(f"cannot parse staged input {prev_path} or {cur_path}")
+            overlap = measure_overlap_frames(prev_path, prev_wav, cur_path, cur_wav)
+            if overlap > 0:
+                trimmed = cur_path.with_suffix(".trimmed.wav")
+                ffmpeg_trim_copy(cur_path, trimmed, overlap, cur_wav.sample_rate)
+                inputs_for_concat.append(trimmed)
+                trimmed_wav = parse_wav_header(trimmed)
+                if trimmed_wav:
+                    total_frames += trimmed_wav.nframes
+            else:
+                inputs_for_concat.append(cur_path)
+                total_frames += cur_wav.nframes
+
+        # Idempotency: if output exists with the right frame count, skip.
+        if jo.output.exists():
+            existing = parse_wav_header(jo.output)
+            if existing and abs(existing.nframes - total_frames) <= 1:
+                progress.update(set_done=ji + 1)
+                continue
+            else:
+                try:
+                    jo.output.unlink()
+                except OSError:
+                    pass
+
+        try:
+            ffmpeg_concat(inputs_for_concat, jo.output)
+            verify_join(jo, total_frames)
+            total_bytes += sum(p.stat().st_size for p in inputs_for_concat if p.exists())
+        except Exception:
+            # delete partial joined file for clean resume
+            if jo.output.exists():
+                try:
+                    jo.output.unlink()
+                except OSError:
+                    pass
+            raise
+        finally:
+            # Clean up trimmed temp files
+            for p in inputs_for_concat:
+                if p.name.endswith(".trimmed.wav") and p.exists():
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+
+        # On success → delete chain members from staging
+        for staged in jo.staged_inputs:
+            try:
+                staged.unlink()
+            except OSError:
+                pass
+        progress.update(set_done=ji + 1)
+
+    progress.finish()
+    elapsed = time.monotonic() - t0
+    if total_bytes > 0 and elapsed > 0:
+        mb_per_s = (total_bytes / (1024 * 1024)) / elapsed
+        update_rate_ema(rates, "join_mb_per_s", mb_per_s)
+    return {"bytes": total_bytes, "elapsed": elapsed}
+
+
+def run_singleton_moves(plan: Plan) -> dict:
+    if not plan.singleton_moves:
+        return {"count": 0}
+    progress = Progress("[3] MOVE", len(plan.singleton_moves), "files")
+    progress.update(set_done=0)
+
+    moved = 0
+    skipped = 0
+    for i, op in enumerate(plan.singleton_moves):
+        op.dst.parent.mkdir(parents=True, exist_ok=True)
+        if op.dst.exists():
+            try:
+                if op.dst.stat().st_size == op.size_bytes:
+                    skipped += 1
+                    # remove stale staged copy
+                    if op.src.exists():
+                        op.src.unlink()
+                    progress.update(set_done=i + 1)
+                    continue
+                else:
+                    raise RuntimeError(
+                        f"destination exists with different size: {op.dst}"
+                    )
+            except OSError as e:
+                raise RuntimeError(f"cannot stat existing dest {op.dst}: {e}")
+        if not op.src.exists():
+            # staged source missing — likely already moved on a previous run
+            progress.update(set_done=i + 1)
+            continue
+        os.rename(op.src, op.dst)
+        moved += 1
+        progress.update(set_done=i + 1)
+
+    progress.finish()
+    return {"count": moved, "skipped": skipped}
+
+
+def run_transcribes(plan: Plan, args: argparse.Namespace, rates: dict) -> dict:
+    if not plan.transcribes:
+        return {"count": 0, "elapsed": 0.0, "failures": []}
+
+    # Group by output_dir so we can batch a single whisper call per dir
+    # (single model load amortized).
+    by_dir: dict[Path, list[TranscribeOp]] = {}
+    for op in plan.transcribes:
+        by_dir.setdefault(op.output_dir, []).append(op)
+
+    progress = Progress("[4] TRANSCRIBE", len(plan.transcribes), "files")
+    progress.update(set_done=0)
+
+    t0 = time.monotonic()
+    total_audio = 0.0
+    done_count = 0
+    failures: list[tuple[Path, str]] = []
+
+    for out_dir, ops in by_dir.items():
+        # idempotency: skip files where .txt already exists
+        targets: list[TranscribeOp] = []
+        for op in ops:
+            txt = op.audio.with_suffix(".txt")
+            if txt.exists():
+                done_count += 1
+                progress.update(set_done=done_count)
+                continue
+            targets.append(op)
+        if not targets:
+            continue
+
+        cmd = [
+            sys.executable, "-m", "whisper",
+            *(str(op.audio) for op in targets),
+            "--model", args.model,
+            "--language", "en",
+            "--output_format", "txt",
+            "--output_dir", str(out_dir),
+        ]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode != 0:
+                for op in targets:
+                    failures.append((op.audio, res.stderr.strip()[:200]))
+            else:
+                for op in targets:
+                    total_audio += op.duration_s
+                    done_count += 1
+                    progress.update(set_done=done_count)
+        except FileNotFoundError as e:
+            for op in targets:
+                failures.append((op.audio, f"whisper module not found: {e}"))
+
+    progress.finish()
+    elapsed = time.monotonic() - t0
+    if total_audio > 0 and elapsed > 0:
+        x_realtime = total_audio / max(0.1, elapsed - 10.0)  # subtract model load
+        rates.setdefault("transcribe_x_realtime", {})
+        cur = rates["transcribe_x_realtime"].get(args.model)
+        if cur is None or cur <= 0:
+            rates["transcribe_x_realtime"][args.model] = x_realtime
+        else:
+            rates["transcribe_x_realtime"][args.model] = (
+                0.3 * x_realtime + 0.7 * cur
+            )
+    return {
+        "count": done_count,
+        "elapsed": elapsed,
+        "failures": failures,
+        "audio_s": total_audio,
+    }
+
+
+def cleanup_staging(plan: Plan) -> None:
+    staging = plan.dest / STAGING_DIR_NAME
+    if not staging.exists():
+        return
+    try:
+        any_left = any(staging.iterdir())
+    except OSError:
+        return
+    if not any_left:
+        try:
+            staging.rmdir()
+        except OSError:
+            pass
+
+
+# ───────────────────────── completion dispatch ─────────────────────────
+
+
+def cmd_complete(kind: str) -> int:
+    """Hidden subcommand for zsh completion."""
+    if kind == "dates":
+        vols = find_dji_volumes()
+        clips = discover_clips(vols)
+        by_date: dict[date, dict[str, int]] = {}
+        for c in clips:
+            d = c.start.date()
+            entry = by_date.setdefault(d, {"clips": 0, "audio_s": 0.0, "tx": set()})
+            entry["clips"] += 1
+            entry["audio_s"] += c.wav.duration_s
+            entry["tx"].add(c.tx)
+        for d in sorted(by_date):
+            e = by_date[d]
+            audio_m = int(e["audio_s"] / 60)
+            tx_str = ",".join(sorted(e["tx"]))
+            print(f"{d.isoformat()}:{e['clips']} clips · {audio_m}m · {tx_str}")
+    elif kind == "models":
+        if WHISPER_CACHE_DIR.exists():
+            for p in sorted(WHISPER_CACHE_DIR.glob("*.pt")):
+                print(p.stem)
+    elif kind == "mics":
+        for v in ("TX01", "TX02", "all"):
+            print(v)
+    elif kind == "versions":
+        for v in ("edit", "orig", "both"):
+            print(v)
+    return 0
+
+
+# ───────────────────────── argparse / main ─────────────────────────
+
+
+def parse_iso_date(s: str) -> date:
+    return datetime.strptime(s, "%Y-%m-%d").date()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="dji-import",
+        description="Import audio from DJI Mic 2 transmitters.",
+    )
+    p.add_argument("--dest", type=Path,
+                   help="Destination directory (required for actual runs)")
+    p.add_argument("--from", dest="from_date", type=parse_iso_date,
+                   help="Earliest recording date (YYYY-MM-DD)")
+    p.add_argument("--to", dest="to_date", type=parse_iso_date,
+                   help="Latest recording date (YYYY-MM-DD)")
+    p.add_argument("--days", type=int,
+                   help="Last N days (mutually exclusive with --from/--to)")
+    p.add_argument("--version", choices=("edit", "orig", "both"), default="both")
+    p.add_argument("--mic", choices=("TX01", "TX02", "all"), default="all")
+    p.add_argument("--join", dest="join", action="store_true", default=True)
+    p.add_argument("--no-join", dest="join", action="store_false")
+    p.add_argument("--transcribe", action="store_true",
+                   help="Transcribe joined files via whisper")
+    p.add_argument("--model", default="tiny",
+                   help="Whisper model (only used with --transcribe)")
+    p.add_argument("--yes", action="store_true",
+                   help="Skip confirmation prompt")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Show preview only; never execute")
+    p.add_argument("--__complete", dest="complete_kind",
+                   help=argparse.SUPPRESS)
+    return p
+
+
+def resolve_date_range(args: argparse.Namespace,
+                        clips_for_default: list[Clip]) -> None:
+    """Mutate args to fill in from_date/to_date."""
+    if args.days is not None:
+        if args.from_date or args.to_date:
+            raise SystemExit("--days is mutually exclusive with --from/--to")
+        today = date.today()
+        args.from_date = today - timedelta(days=args.days)
+        args.to_date = today
+        return
+    if args.to_date is None:
+        args.to_date = date.today()
+    if args.from_date is None:
+        if not clips_for_default:
+            raise SystemExit(
+                "no clips found on connected mics; specify --from explicitly"
+            )
+        args.from_date = min(c.start.date() for c in clips_for_default)
+
+
+def confirm(prompt: str) -> bool:
+    if not sys.stdin.isatty():
+        return False  # never block in non-interactive contexts
+    sys.stderr.write(prompt)
+    sys.stderr.flush()
+    try:
+        ans = input().strip().lower()
+    except EOFError:
+        return False
+    return ans in ("y", "yes")
+
+
+def validate_runtime() -> None:
+    if shutil.which("ffmpeg") is None:
+        raise SystemExit("error: ffmpeg not found on PATH")
+
+
+def validate_whisper(model: str) -> None:
+    try:
+        import_check = subprocess.run(
+            [sys.executable, "-c", "import whisper"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if import_check.returncode != 0:
+            raise SystemExit(
+                f"error: cannot import whisper Python package "
+                f"(--transcribe requested). stderr:\n{import_check.stderr}"
+            )
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        raise SystemExit(f"error: whisper validation failed: {e}")
+    pt = WHISPER_CACHE_DIR / f"{model}.pt"
+    if not pt.exists():
+        raise SystemExit(
+            f"error: whisper model '{model}' not found at {pt}. "
+            f"Available: "
+            f"{', '.join(sorted(p.stem for p in WHISPER_CACHE_DIR.glob('*.pt')))}"
+        )
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.complete_kind:
+        return cmd_complete(args.complete_kind)
+
+    validate_runtime()
+    if args.transcribe:
+        validate_whisper(args.model)
+
+    if args.dest is None:
+        parser.error("--dest is required")
+
+
+    # Discovery
+    volumes = find_dji_volumes()
+    if not volumes:
+        sys.stderr.write("error: no DJI cards found at /Volumes/*. "
+                         "Plug in your transmitters and try again.\n")
+        return 2
+
+    clips_all = discover_clips(volumes)
+    if not clips_all:
+        sys.stderr.write("error: connected volumes have no DJI files matching pattern.\n")
+        return 2
+
+    resolve_date_range(args, clips_all)
+
+    # Filter by date range, mic, version
+    clips = filter_by_args(clips_all, args)
+    if args.version == "both":
+        # Keep both
+        pass
+    if not clips:
+        sys.stderr.write("no clips matched the given filters.\n")
+        return 0
+
+    # Build chains and plan
+    chains = build_chains(clips)
+    plan = build_plan(chains, args)
+
+    # Estimate
+    rates = load_rates()
+    first_run = not RATE_CACHE_PATH.exists()
+    est = estimate_seconds(plan, rates,
+                            args.model if args.transcribe else None,
+                            first_run)
+
+    # Preview
+    print(format_preview(plan, chains, volumes, args, est))
+    print()
+
+    if args.dry_run:
+        print("(dry run — nothing executed)")
+        return 0
+
+    if not args.yes:
+        if not confirm("Proceed? [y/N] "):
+            print("aborted.")
+            return 1
+
+    # Execute
+    overall_t0 = time.monotonic()
+    try:
+        copy_stats = run_copies(plan, rates)
+        join_stats = run_joins(plan, rates)
+        move_stats = run_singleton_moves(plan)
+        trans_stats = run_transcribes(plan, args, rates)
+    except KeyboardInterrupt:
+        print("\ninterrupted; staging left intact for resume on next run.")
+        return 130
+    except RuntimeError as e:
+        print(f"\nerror: {e}")
+        return 3
+
+    cleanup_staging(plan)
+    save_rates(rates)
+
+    elapsed = time.monotonic() - overall_t0
+    print()
+    print(f"Done in {fmt_duration(elapsed)} (estimated {fmt_duration(est['total'])}).")
+    print(f"  Joined files: {len(plan.joins)}")
+    print(f"  Singletons:   {move_stats.get('count', 0)} "
+          f"(skipped {move_stats.get('skipped', 0)})")
+    if plan.transcribes:
+        x_realtime = (trans_stats["audio_s"] / max(0.1, trans_stats["elapsed"] - 10.0)
+                      if trans_stats["elapsed"] > 10 else 0.0)
+        print(f"  Transcripts:  {trans_stats['count']} "
+              f"({fmt_audio_duration(trans_stats['audio_s'])} audio · "
+              f"{fmt_duration(trans_stats['elapsed'])} wall · "
+              f"{x_realtime:.1f}× realtime)")
+    if trans_stats.get("failures"):
+        print(f"  Transcribe failures: {len(trans_stats['failures'])}")
+        for path, err in trans_stats["failures"][:3]:
+            print(f"    {path.name}: {err[:120]}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

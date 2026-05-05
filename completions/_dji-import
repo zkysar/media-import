@@ -1,0 +1,59 @@
+#compdef dji-import
+
+# dji-import zsh completion
+# Dynamic suggestions (dates, models) come from `dji-import --__complete <kind>`
+# which prints "value:description" lines for _describe.
+
+_dji-import() {
+  local context state state_descr line
+  typeset -A opt_args
+
+  _arguments -C \
+    '--dest[Destination directory]:dest:_files -/' \
+    '--from[Earliest recording date]:date:_dji_import_dates' \
+    '--to[Latest recording date]:date:_dji_import_dates' \
+    '--days[Last N days]:N:' \
+    '--version[Which version to import]:version:(edit orig both)' \
+    '--mic[Which transmitter]:mic:_dji_import_mics' \
+    '--join[Join auto-split chains (default)]' \
+    '--no-join[Do not join auto-split chains]' \
+    '--transcribe[Transcribe joined files]' \
+    '--model[Whisper model]:model:_dji_import_models' \
+    '--yes[Skip confirmation prompt]' \
+    '--dry-run[Preview only]' \
+    '-h[Show help]' \
+    '--help[Show help]'
+}
+
+_dji_import_dates() {
+  local -a dates
+  local entry
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] && dates+=("$entry")
+  done < <(dji-import --__complete dates 2>/dev/null)
+  if (( ${#dates[@]} > 0 )); then
+    _describe 'recording date' dates
+  fi
+}
+
+_dji_import_models() {
+  local -a models
+  local entry
+  while IFS= read -r entry; do
+    [[ -n "$entry" ]] && models+=("$entry")
+  done < <(dji-import --__complete models 2>/dev/null)
+  if (( ${#models[@]} > 0 )); then
+    _describe 'whisper model' models
+  fi
+}
+
+_dji_import_mics() {
+  local -a mics=(
+    'TX01:transmitter 1'
+    'TX02:transmitter 2'
+    'all:both transmitters'
+  )
+  _describe 'mic' mics
+}
+
+_dji-import "$@"
