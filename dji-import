@@ -536,6 +536,27 @@ def estimate_seconds(plan: Plan, rates: dict, model: str | None,
     }
 
 
+# ───────────────────────── disk space ─────────────────────────
+
+
+def free_bytes_at(path: Path) -> int:
+    p = path
+    while not p.exists():
+        if p.parent == p:
+            break
+        p = p.parent
+    return shutil.disk_usage(p).free
+
+
+def peak_required_bytes(plan: Plan) -> tuple[int, int, int]:
+    joined_output_bytes = sum(
+        sum(c.size_bytes for c in jo.chain.clips) for jo in plan.joins
+    )
+    peak = sum(op.size_bytes for op in plan.copies) + joined_output_bytes
+    singleton_bytes = sum(op.size_bytes for op in plan.singleton_moves)
+    return peak, joined_output_bytes, singleton_bytes
+
+
 # ───────────────────────── preview formatting ─────────────────────────
 
 
@@ -674,10 +695,17 @@ def format_preview(plan: Plan, chains: list[Chain], volumes: list[Path],
     lines.append("")
 
     # Disk space
-    joined_bytes = sum(sum(c.size_bytes for c in jo.chain.clips) for jo in plan.joins)
-    singleton_bytes = sum(op.size_bytes for op in plan.singleton_moves)
+    peak, joined_bytes, singleton_bytes = peak_required_bytes(plan)
+    free = free_bytes_at(plan.dest)
+    headroom = free - peak
+    headroom_str = fmt_size(headroom) if headroom >= 0 else "-" + fmt_size(-headroom)
     lines.append(f"Disk space at dest: ~{fmt_size(joined_bytes + singleton_bytes)}")
     lines.append("  (joined files + singletons; chain members staged in temp during join, then removed)")
+    lines.append(f"  Required peak:   {fmt_size(peak)}")
+    lines.append(f"  Free at dest:    {fmt_size(free)}")
+    lines.append(f"  Headroom:        {headroom_str}")
+    if headroom < 0:
+        lines.append(f"  ⚠ INSUFFICIENT SPACE — short by {fmt_size(-headroom)}")
     return "\n".join(lines)
 
 
@@ -1411,6 +1439,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run:
         print("(dry run — nothing executed)")
         return 0
+
+    peak, _, _ = peak_required_bytes(plan)
+    free = free_bytes_at(plan.dest)
+    if peak > free:
+        sys.stderr.write(
+            f"error: insufficient free space at {plan.dest}: "
+            f"need {fmt_size(peak)}, have {fmt_size(free)}, "
+            f"short by {fmt_size(peak - free)}.\n"
+        )
+        return 4
 
     if not args.yes:
         if not confirm("Proceed? [y/N] "):
