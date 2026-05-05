@@ -410,8 +410,8 @@ def build_plan(chains: list[Chain], args: argparse.Namespace) -> Plan:
                                                         size_bytes=c.size_bytes))
                 # Transcribe singletons too (full recordings, not chain pieces).
                 if args.transcribe:
-                    txt_path = final.with_suffix(".txt")
-                    if not txt_path.exists():
+                    srt_path = final.with_suffix(".srt")
+                    if not srt_path.exists():
                         plan.transcribes.append(TranscribeOp(
                             audio=final,
                             output_dir=target_dir,
@@ -444,8 +444,8 @@ def build_plan(chains: list[Chain], args: argparse.Namespace) -> Plan:
                                           expected_frames=sum_input_frames))
 
             if args.transcribe:
-                txt_path = joined_path.with_suffix(".txt")
-                if not txt_path.exists():
+                srt_path = joined_path.with_suffix(".srt")
+                if not srt_path.exists():
                     plan.transcribes.append(TranscribeOp(
                         audio=joined_path,
                         output_dir=target_dir,
@@ -1048,11 +1048,11 @@ def run_transcribes(plan: Plan, args: argparse.Namespace, rates: dict) -> dict:
     failures: list[tuple[Path, str]] = []
 
     for out_dir, ops in by_dir.items():
-        # idempotency: skip files where .txt already exists
+        # idempotency: skip files where .srt already exists
         targets: list[TranscribeOp] = []
         for op in ops:
-            txt = op.audio.with_suffix(".txt")
-            if txt.exists():
+            srt = op.audio.with_suffix(".srt")
+            if srt.exists():
                 done_count += 1
                 progress.update(set_done=done_count)
                 continue
@@ -1065,7 +1065,7 @@ def run_transcribes(plan: Plan, args: argparse.Namespace, rates: dict) -> dict:
             *(str(op.audio) for op in targets),
             "--model", args.model,
             "--language", "en",
-            "--output_format", "txt",
+            "--output_format", "srt",
             "--output_dir", str(out_dir),
         ]
         try:
