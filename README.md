@@ -28,7 +28,7 @@ See `~/projects/plans/2026-05-04-dji-import-design.md` for the full design.
 
 | Flag                  | Default      | Notes |
 |-----------------------|--------------|-------|
-| `--dest <path>`       | (required)   | Where files land. `edit/` and `orig/` subfolders created. |
+| `--dest <path>`       | (required)   | Where files land. See [Output layout](#output-layout). |
 | `--from YYYY-MM-DD`   | earliest     | Filter by recording timestamp from filename. |
 | `--to YYYY-MM-DD`     | today        | Inclusive. |
 | `--days N`            |              | Shorthand for `--from <N days ago>`; mutually exclusive with `--from`/`--to`. |
@@ -49,6 +49,20 @@ Once installed, tab completion provides:
 - `--version <TAB>` — `edit`, `orig`, `both`
 - `--model <TAB>` — only the whisper models actually present in `~/.cache/whisper/`
 - `--dest <TAB>` — directory completion
+
+## Output layout
+
+```
+<dest>/RAW/<YYYY-MM-DD>/DJI-MICS/<TX>/<CATEGORY>/
+```
+
+- `RAW/` — top-level marker for raw offload. Always present.
+- `<YYYY-MM-DD>` — recording date from the filename. Always present.
+- `DJI-MICS/` — device-class folder. Reserved so future classes (e.g. `SONY-A7C`) sit alongside.
+- `<TX>` — `TX01` / `TX02`.
+- `<CATEGORY>` — `EDIT`, `ORIG`, or `TRANSCRIPTS`.
+
+Example: `~/Audio/podcast/RAW/2026-05-03/DJI-MICS/TX01/EDIT/TX01_20260503_112250_140603_edit_joined.wav`
 
 ## Auto-split detection
 

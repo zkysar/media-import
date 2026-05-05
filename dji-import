@@ -27,6 +27,9 @@ DJI_FILE_RE = re.compile(r"^TX(\d+)_MIC(\d+)_(\d{8})_(\d{6})_(edit|orig)\.wav$")
 WHISPER_CACHE_DIR = Path.home() / ".cache" / "whisper"
 RATE_CACHE_PATH = Path.home() / ".cache" / "dji-import" / "rates.json"
 STAGING_DIR_NAME = ".dji-import-staging"
+RAW_ROOT = "RAW"
+DJI_DEVICE_CLASS = "DJI-MICS"
+TRANSCRIPTS_CATEGORY = "TRANSCRIPTS"
 
 DURATION_AUTOSPLIT_LO = 1799.5
 DURATION_AUTOSPLIT_HI = 1800.5
@@ -373,27 +376,26 @@ def joined_filename(chain: Chain) -> str:
     return f"{chain.tx}_{s}_{e}_{chain.version}_joined.wav"
 
 
-def dest_dir_for(chain_or_clip, dest_root: Path, version: str, tx: str,
-                 multi_date: bool, bucket: date) -> Path:
-    p = dest_root / version
-    if multi_date:
-        p = p / bucket.isoformat()
-    p = p / tx
-    return p
+def dest_dir_for(dest_root: Path, bucket: date, tx: str, category: str) -> Path:
+    """Output dir: <dest>/RAW/<date>/<device-class>/<tx>/<category>/.
+
+    `category` is upper-cased on the way in so callers can pass the lowercase
+    `chain.version` ("edit"/"orig") that's used elsewhere (e.g. filenames).
+    """
+    return (dest_root / RAW_ROOT / bucket.isoformat()
+            / DJI_DEVICE_CLASS / tx / category.upper())
 
 
 def build_plan(chains: list[Chain], args: argparse.Namespace) -> Plan:
     plan = Plan(dest=args.dest)
 
-    # date bucketing decision: multi-date → include date subfolder
-    all_dates = sorted({ch.date_bucket for ch in chains})
-    multi_date = len(all_dates) > 1
-
     staging = args.dest / STAGING_DIR_NAME
 
     for chain in chains:
-        target_dir = dest_dir_for(chain, args.dest, chain.version, chain.tx,
-                                  multi_date, chain.date_bucket)
+        target_dir = dest_dir_for(args.dest, chain.date_bucket, chain.tx,
+                                  chain.version)
+        transcripts_dir = dest_dir_for(args.dest, chain.date_bucket, chain.tx,
+                                       TRANSCRIPTS_CATEGORY)
 
         if chain.is_singleton or not args.join:
             # Stage and move (or just leave as singletons).
@@ -410,11 +412,11 @@ def build_plan(chains: list[Chain], args: argparse.Namespace) -> Plan:
                                                         size_bytes=c.size_bytes))
                 # Transcribe singletons too (full recordings, not chain pieces).
                 if args.transcribe:
-                    srt_path = final.with_suffix(".srt")
+                    srt_path = transcripts_dir / (final.stem + ".srt")
                     if not srt_path.exists():
                         plan.transcribes.append(TranscribeOp(
                             audio=final,
-                            output_dir=target_dir,
+                            output_dir=transcripts_dir,
                             duration_s=c.wav.duration_s,
                         ))
         else:
@@ -444,11 +446,11 @@ def build_plan(chains: list[Chain], args: argparse.Namespace) -> Plan:
                                           expected_frames=sum_input_frames))
 
             if args.transcribe:
-                srt_path = joined_path.with_suffix(".srt")
+                srt_path = transcripts_dir / (joined_path.stem + ".srt")
                 if not srt_path.exists():
                     plan.transcribes.append(TranscribeOp(
                         audio=joined_path,
-                        output_dir=target_dir,
+                        output_dir=transcripts_dir,
                         duration_s=sum(c.wav.duration_s for c in chain.clips),
                     ))
 
@@ -611,7 +613,7 @@ def format_preview(plan: Plan, chains: list[Chain], volumes: list[Path],
                 chain_str += f" · {n_chains} auto-split chain{'s' if n_chains != 1 else ''}"
             if n_single:
                 chain_str += f" · {n_single} singleton{'s' if n_single != 1 else ''}"
-            lines.append(f"  {tx}/{v}: {n_clips} clips · {fmt_audio_duration(audio_s)} · {fmt_size(size_b)}{chain_str}")
+            lines.append(f"  {tx}/{v.upper()}: {n_clips} clips · {fmt_audio_duration(audio_s)} · {fmt_size(size_b)}{chain_str}")
     lines.append("")
 
     # Joins
@@ -1048,10 +1050,11 @@ def run_transcribes(plan: Plan, args: argparse.Namespace, rates: dict) -> dict:
     failures: list[tuple[Path, str]] = []
 
     for out_dir, ops in by_dir.items():
-        # idempotency: skip files where .srt already exists
+        # idempotency: skip files where .srt already exists in the
+        # transcripts dir (same dir whisper writes to).
         targets: list[TranscribeOp] = []
         for op in ops:
-            srt = op.audio.with_suffix(".srt")
+            srt = op.output_dir / (op.audio.stem + ".srt")
             if srt.exists():
                 done_count += 1
                 progress.update(set_done=done_count)
