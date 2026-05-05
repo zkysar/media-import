@@ -1123,33 +1123,126 @@ def cleanup_staging(plan: Plan) -> None:
 # ───────────────────────── completion dispatch ─────────────────────────
 
 
-def cmd_complete(kind: str) -> int:
+def _filter_clips(clips: list[Clip], *,
+                  ctx_from: date | None = None,
+                  ctx_to: date | None = None,
+                  ctx_mic: str | None = None,
+                  ctx_version: str | None = None) -> list[Clip]:
+    out: list[Clip] = []
+    for c in clips:
+        if ctx_from and c.start.date() < ctx_from:
+            continue
+        if ctx_to and c.start.date() > ctx_to:
+            continue
+        if ctx_mic and ctx_mic != "all" and c.tx != ctx_mic:
+            continue
+        if ctx_version == "edit" and c.version != "edit":
+            continue
+        if ctx_version == "orig" and c.version != "orig":
+            continue
+        out.append(c)
+    return out
+
+
+def _summarize(clips: list[Clip]) -> tuple[int, int, str]:
+    n = len(clips)
+    audio_m = int(sum(c.wav.duration_s for c in clips) / 60)
+    tx_str = ",".join(sorted({c.tx for c in clips})) if clips else ""
+    return n, audio_m, tx_str
+
+
+def cmd_complete(kind: str, args: argparse.Namespace) -> int:
     """Hidden subcommand for zsh completion."""
-    if kind == "dates":
-        vols = find_dji_volumes()
-        clips = discover_clips(vols)
-        by_date: dict[date, dict[str, int]] = {}
-        for c in clips:
-            d = c.start.date()
-            entry = by_date.setdefault(d, {"clips": 0, "audio_s": 0.0, "tx": set()})
-            entry["clips"] += 1
-            entry["audio_s"] += c.wav.duration_s
-            entry["tx"].add(c.tx)
-        for d in sorted(by_date):
-            e = by_date[d]
-            audio_m = int(e["audio_s"] / 60)
-            tx_str = ",".join(sorted(e["tx"]))
-            print(f"{d.isoformat()}:{e['clips']} clips · {audio_m}m · {tx_str}")
-    elif kind == "models":
+
+    def _try_date(s: str | None) -> date | None:
+        if not s:
+            return None
+        try:
+            return datetime.strptime(s, "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+    ctx_from = _try_date(getattr(args, "ctx_from", None))
+    ctx_to = _try_date(getattr(args, "ctx_to", None))
+    raw_mic = getattr(args, "ctx_mic", None)
+    ctx_mic = raw_mic if raw_mic in ("TX01", "TX02", "all") else None
+    raw_ver = getattr(args, "ctx_version", None)
+    ctx_version = raw_ver if raw_ver in ("edit", "orig", "both") else None
+
+    if kind == "models":
         if WHISPER_CACHE_DIR.exists():
             for p in sorted(WHISPER_CACHE_DIR.glob("*.pt")):
                 print(p.stem)
-    elif kind == "mics":
+        return 0
+
+    if kind not in ("dates-from", "dates-to", "mics", "versions"):
+        return 0
+
+    vols = find_dji_volumes()
+    clips = discover_clips(vols)
+    if not clips:
+        return 0
+
+    if kind == "dates-from":
+        # Don't filter by --from (that's what we're picking). Filter by everything else.
+        base = _filter_clips(clips, ctx_to=ctx_to,
+                             ctx_mic=ctx_mic, ctx_version=ctx_version)
+        if not base:
+            return 0
+        all_dates = sorted({c.start.date() for c in base})
+        upper = ctx_to or max(c.start.date() for c in base)
+        for d in all_dates:
+            if d > upper:
+                continue
+            sel = [c for c in base if d <= c.start.date() <= upper]
+            if not sel:
+                continue
+            n, audio_m, tx_str = _summarize(sel)
+            print(f"{d.isoformat()}:{n} clips · {audio_m}m · {tx_str}")
+        return 0
+
+    if kind == "dates-to":
+        base = _filter_clips(clips, ctx_from=ctx_from,
+                             ctx_mic=ctx_mic, ctx_version=ctx_version)
+        if not base:
+            return 0
+        all_dates = sorted({c.start.date() for c in base})
+        lower = ctx_from or min(c.start.date() for c in base)
+        for d in all_dates:
+            if d < lower:
+                continue
+            sel = [c for c in base if lower <= c.start.date() <= d]
+            if not sel:
+                continue
+            n, audio_m, tx_str = _summarize(sel)
+            print(f"{d.isoformat()}:{n} clips · {audio_m}m · {tx_str}")
+        return 0
+
+    if kind == "mics":
+        base = _filter_clips(clips, ctx_from=ctx_from, ctx_to=ctx_to,
+                             ctx_version=ctx_version)
+        labels = {"TX01": "transmitter 1",
+                  "TX02": "transmitter 2",
+                  "all":  "both transmitters"}
         for v in ("TX01", "TX02", "all"):
-            print(v)
-    elif kind == "versions":
+            sel = base if v == "all" else [c for c in base if c.tx == v]
+            if not sel:
+                continue
+            n, audio_m, _ = _summarize(sel)
+            print(f"{v}:{n} clips · {audio_m}m · {labels[v]}")
+        return 0
+
+    if kind == "versions":
+        base = _filter_clips(clips, ctx_from=ctx_from, ctx_to=ctx_to,
+                             ctx_mic=ctx_mic)
         for v in ("edit", "orig", "both"):
-            print(v)
+            sel = base if v == "both" else [c for c in base if c.version == v]
+            if not sel:
+                continue
+            n, audio_m, tx_str = _summarize(sel)
+            print(f"{v}:{n} clips · {audio_m}m · {tx_str}")
+        return 0
+
     return 0
 
 
@@ -1187,6 +1280,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Show preview only; never execute")
     p.add_argument("--__complete", dest="complete_kind",
                    help=argparse.SUPPRESS)
+    p.add_argument("--__ctx-from", dest="ctx_from", help=argparse.SUPPRESS)
+    p.add_argument("--__ctx-to", dest="ctx_to", help=argparse.SUPPRESS)
+    p.add_argument("--__ctx-mic", dest="ctx_mic", help=argparse.SUPPRESS)
+    p.add_argument("--__ctx-version", dest="ctx_version", help=argparse.SUPPRESS)
     return p
 
 
@@ -1254,7 +1351,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.complete_kind:
-        return cmd_complete(args.complete_kind)
+        return cmd_complete(args.complete_kind, args)
 
     validate_runtime()
     if args.transcribe:

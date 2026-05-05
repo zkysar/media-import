@@ -1,8 +1,11 @@
 #compdef dji-import
 
 # dji-import zsh completion
-# Dynamic suggestions (dates, models) come from `dji-import --__complete <kind>`
-# which prints "value:description" lines for _describe.
+# Dynamic suggestions (dates, mics, versions, models) come from
+# `dji-import --__complete <kind>` which prints "value:description" lines for
+# _describe. Data-driven flags (--from, --to, --mic, --version) progressively
+# filter each other: each candidate set is computed from clips that pass every
+# *other* currently-set flag.
 
 _dji-import() {
   local context state state_descr line
@@ -10,11 +13,11 @@ _dji-import() {
 
   _arguments -C \
     '--dest[Destination directory]:dest:_files -/' \
-    '--from[Earliest recording date]:date:_dji_import_dates' \
-    '--to[Latest recording date]:date:_dji_import_dates' \
+    '--from[Earliest recording date]:date: _dji_import_complete dates-from' \
+    '--to[Latest recording date]:date: _dji_import_complete dates-to' \
     '--days[Last N days]:N:' \
-    '--version[Which version to import]:version:(edit orig both)' \
-    '--mic[Which transmitter]:mic:_dji_import_mics' \
+    '--version[Which version to import]:version: _dji_import_complete versions' \
+    '--mic[Which transmitter]:mic: _dji_import_complete mics' \
     '--join[Join auto-split chains (default)]' \
     '--no-join[Do not join auto-split chains]' \
     '--transcribe[Transcribe joined files]' \
@@ -25,15 +28,71 @@ _dji-import() {
     '--help[Show help]'
 }
 
-_dji_import_dates() {
-  local -a dates
+# Return the value following the last occurrence of $1 in $words, or "".
+# Handles both space-separated (--from VALUE) and equals (--from=VALUE) forms.
+# Multiple occurrences → last wins. Tolerates partial / mid-edit values;
+# callers must validate.
+_dji_import_arg_value() {
+  local flag=$1
+  local val="" i w
+  for (( i = 1; i <= ${#words[@]}; i++ )); do
+    w="${words[i]}"
+    if [[ $w == "$flag" ]]; then
+      val="${words[i+1]:-}"
+    elif [[ $w == "$flag="* ]]; then
+      val="${w#*=}"
+    fi
+  done
+  printf '%s' "$val"
+}
+
+# Dispatcher for data-driven completions. Gathers values of the *other* set
+# flags from $words, validates each, forwards only the valid ones to
+# `dji-import --__complete <kind>` via --__ctx-* flags.
+_dji_import_complete() {
+  local kind=$1
+  local from_val to_val mic_val ver_val
+  from_val=$(_dji_import_arg_value --from)
+  to_val=$(_dji_import_arg_value --to)
+  mic_val=$(_dji_import_arg_value --mic)
+  ver_val=$(_dji_import_arg_value --version)
+
+  # Don't pass the value of the flag currently being completed.
+  case "$kind" in
+    dates-from) from_val="" ;;
+    dates-to)   to_val="" ;;
+    mics)       mic_val="" ;;
+    versions)   ver_val="" ;;
+  esac
+
+  local -a ctx_args
+  if [[ -n "$from_val" && "$from_val" == [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] ]]; then
+    ctx_args+=(--__ctx-from "$from_val")
+  fi
+  if [[ -n "$to_val" && "$to_val" == [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] ]]; then
+    ctx_args+=(--__ctx-to "$to_val")
+  fi
+  case "$mic_val" in
+    TX01|TX02|all) ctx_args+=(--__ctx-mic "$mic_val") ;;
+  esac
+  case "$ver_val" in
+    edit|orig|both) ctx_args+=(--__ctx-version "$ver_val") ;;
+  esac
+
+  local -a items
   local entry
   while IFS= read -r entry; do
-    [[ -n "$entry" ]] && dates+=("$entry")
-  done < <(dji-import --__complete dates 2>/dev/null)
-  if (( ${#dates[@]} > 0 )); then
-    _describe 'recording date' dates
-  fi
+    [[ -n "$entry" ]] && items+=("$entry")
+  done < <(dji-import --__complete "$kind" "${ctx_args[@]}" 2>/dev/null)
+
+  (( ${#items[@]} > 0 )) || return 1
+
+  case "$kind" in
+    dates-from) _describe 'from date' items ;;
+    dates-to)   _describe 'to date' items ;;
+    mics)       _describe 'mic' items ;;
+    versions)   _describe 'version' items ;;
+  esac
 }
 
 _dji_import_models() {
@@ -45,15 +104,6 @@ _dji_import_models() {
   if (( ${#models[@]} > 0 )); then
     _describe 'whisper model' models
   fi
-}
-
-_dji_import_mics() {
-  local -a mics=(
-    'TX01:transmitter 1'
-    'TX02:transmitter 2'
-    'all:both transmitters'
-  )
-  _describe 'mic' mics
 }
 
 _dji-import "$@"
