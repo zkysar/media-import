@@ -686,6 +686,24 @@ def is_tty() -> bool:
     return sys.stderr.isatty()
 
 
+def status(msg: str, *, done: bool = False) -> None:
+    """Transient status line to stderr. On TTY overwrites in place;
+    on non-TTY emits one line per call. `done=True` finalizes with a newline."""
+    if is_tty():
+        sys.stderr.write("\r\033[2K" + msg)
+        if done:
+            sys.stderr.write("\n")
+        sys.stderr.flush()
+    else:
+        sys.stderr.write(msg + "\n")
+
+
+def clear_status() -> None:
+    if is_tty():
+        sys.stderr.write("\r\033[2K")
+        sys.stderr.flush()
+
+
 def render_bar(done: int, total: int, width: int = 20) -> str:
     if total <= 0:
         return "░" * width
@@ -1237,6 +1255,7 @@ def main(argv: list[str] | None = None) -> int:
 
     validate_runtime()
     if args.transcribe:
+        status("Checking whisper install...")
         validate_whisper(args.model)
 
     if args.dest is None:
@@ -1244,17 +1263,23 @@ def main(argv: list[str] | None = None) -> int:
 
 
     # Discovery
+    status("Scanning /Volumes for DJI cards...")
     volumes = find_dji_volumes()
     if not volumes:
+        clear_status()
         sys.stderr.write("error: no DJI cards found at /Volumes/*. "
                          "Plug in your transmitters and try again.\n")
         return 2
 
+    vol_names = ", ".join(v.name for v in volumes)
+    status(f"Indexing audio on {len(volumes)} card(s): {vol_names}...")
     clips_all = discover_clips(volumes)
     if not clips_all:
+        clear_status()
         sys.stderr.write("error: connected volumes have no DJI files matching pattern.\n")
         return 2
 
+    status(f"Found {len(clips_all)} clips · planning import...")
     resolve_date_range(args, clips_all)
 
     # Filter by date range, mic, version
@@ -1263,6 +1288,7 @@ def main(argv: list[str] | None = None) -> int:
         # Keep both
         pass
     if not clips:
+        clear_status()
         sys.stderr.write("no clips matched the given filters.\n")
         return 0
 
@@ -1278,6 +1304,7 @@ def main(argv: list[str] | None = None) -> int:
                             first_run)
 
     # Preview
+    clear_status()
     print(format_preview(plan, chains, volumes, args, est))
     print()
 
