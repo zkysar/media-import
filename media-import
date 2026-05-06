@@ -53,6 +53,7 @@ SONY_VIDEO_DB_PATHS = (
 )
 SONY_STILL_EXTS = {".JPG", ".ARW"}    # HEIF intentionally excluded — user does not shoot it
 SONY_VIDEO_EXTS = {".MP4"}
+SONY_DATE_CACHE_DIR = Path.home() / ".cache" / "media-import" / "sony-dates"
 
 # Default rate model — used until rate cache has data.
 DEFAULT_RATES = {
@@ -1482,8 +1483,82 @@ def sony_build_plan(groups: list[SonyGroup],
     return plan
 
 
-def sony_completion_dates(volumes):
-    return []
+def sony_completion_dates(volumes: list[Path]) -> list[date]:
+    """All distinct shoot dates across Sony volumes, with on-disk cache.
+
+    Cache is keyed by the volume's directory name and a cheap content
+    signature (file count + max mtime under media folders). Stale cache
+    entries are silently regenerated.
+    """
+    dates: set[date] = set()
+    for vol in volumes:
+        cache_path = SONY_DATE_CACHE_DIR / f"{vol.name}.json"
+        sig = _sony_volume_signature(vol)
+        cached = _load_sony_date_cache(cache_path)
+        if cached and cached.get("sig") == sig:
+            for s in cached.get("dates", []):
+                try:
+                    dates.add(date.fromisoformat(s))
+                except (TypeError, ValueError):
+                    pass
+            continue
+        # Cold-cache: scan + write.
+        groups = sony_discover([vol])
+        scanned = sorted({g.timestamp.date() for g in groups})
+        dates.update(scanned)
+        _save_sony_date_cache(cache_path, sig,
+                                [d.isoformat() for d in scanned])
+    return sorted(dates)
+
+
+def _sony_volume_signature(vol: Path) -> str:
+    """Cheap signature: file count + max mtime under DCIM/MSDCF + M4ROOT/CLIP."""
+    paths: list[Path] = []
+    dcim = vol / "DCIM"
+    if dcim.is_dir():
+        try:
+            for sub in dcim.iterdir():
+                if SONY_STILLS_DIR_RE.match(sub.name):
+                    try:
+                        paths.extend(sub.glob("*"))
+                    except (OSError, PermissionError):
+                        continue
+        except (OSError, PermissionError):
+            pass
+    for vid_root in SONY_VIDEO_ROOTS:
+        clip = vol / vid_root / "CLIP"
+        if clip.is_dir():
+            try:
+                paths.extend(clip.glob("*"))
+            except (OSError, PermissionError):
+                continue
+    if not paths:
+        return "empty"
+    try:
+        max_mtime = max((p.stat().st_mtime for p in paths if p.is_file()),
+                          default=0)
+    except OSError:
+        max_mtime = 0
+    return f"{len(paths)}:{int(max_mtime)}"
+
+
+def _load_sony_date_cache(p: Path) -> dict | None:
+    if not p.exists():
+        return None
+    try:
+        with open(p) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _save_sony_date_cache(p: Path, sig: str, dates: list[str]) -> None:
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "w") as f:
+            json.dump({"sig": sig, "dates": dates}, f)
+    except OSError:
+        pass
 
 
 SONY_A7C = Device(
