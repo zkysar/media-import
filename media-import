@@ -1000,6 +1000,27 @@ def ffmpeg_concat(inputs: list[Path], output: Path) -> None:
             pass
 
 
+def ffmpeg_extract_audio(src: Path, dst: Path) -> None:
+    """Extract the audio track from a video file to a 16kHz mono PCM WAV.
+
+    Uses the resample/mono settings whisper wants natively, so the WAV is
+    immediately usable as transcribe input — no intermediate normalization.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", str(src),
+        "-vn",                    # no video
+        "-acodec", "pcm_s16le",   # 16-bit PCM WAV — whisper input
+        "-ar", "16000",           # sample rate whisper wants
+        "-ac", "1",               # mono
+        str(dst),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed: {proc.stderr}")
+
+
 def verify_join(jo: JoinOp, expected_total_frames: int) -> None:
     """Compare output WAV header to expected. Raises on mismatch."""
     out_wav = parse_wav_header(jo.output)
