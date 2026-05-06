@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 # ─────────────────────────── constants ────────────────────────────
 
@@ -151,6 +151,17 @@ class Plan:
     args_summary: dict = field(default_factory=dict)
 
 
+@dataclass
+class Device:
+    name: str
+    device_class: str
+    detect: Callable[[Path], bool]
+    discover: Callable[[list[Path]], list]
+    filter_by_args: Callable[[list, argparse.Namespace], list]
+    build_plan: Callable[[list, argparse.Namespace], 'Plan']
+    completion_dates: Callable[[list[Path]], list[date]]
+
+
 # ─────────────────────────── helpers ────────────────────────────
 
 def require_exiftool() -> None:
@@ -221,33 +232,31 @@ def read_data_window_bytes(path: Path, wav: Wav,
 # ───────────────────────────── discovery ─────────────────────────────
 
 
+def _dji_volume_detect(vol: Path) -> bool:
+    """True if `vol` looks like a card with DJI Mic recordings."""
+    if not vol.is_dir():
+        return False
+    try:
+        for p in vol.iterdir():
+            if DJI_FILE_RE.search(p.name):
+                return True
+            if p.is_dir():
+                try:
+                    for q in p.iterdir():
+                        if DJI_FILE_RE.search(q.name):
+                            return True
+                except (OSError, PermissionError):
+                    continue
+    except (OSError, PermissionError):
+        pass
+    return False
+
+
 def find_dji_volumes() -> list[Path]:
     """Scan /Volumes/* for any volume containing files matching DJI pattern."""
     if not VOLUMES_GLOB.exists():
         return []
-    out: list[Path] = []
-    for vol in VOLUMES_GLOB.iterdir():
-        if not vol.is_dir():
-            continue
-        # Cheap check: any matching file at root or one level deep
-        try:
-            for p in vol.iterdir():
-                if DJI_FILE_RE.search(p.name):
-                    out.append(vol)
-                    break
-                if p.is_dir():
-                    try:
-                        for q in p.iterdir():
-                            if DJI_FILE_RE.search(q.name):
-                                out.append(vol)
-                                break
-                    except (OSError, PermissionError):
-                        continue
-                    if vol in out:
-                        break
-        except (OSError, PermissionError):
-            continue
-    return out
+    return [v for v in VOLUMES_GLOB.iterdir() if _dji_volume_detect(v)]
 
 
 def discover_clips(volumes: Iterable[Path]) -> list[Clip]:
@@ -1157,6 +1166,80 @@ def cleanup_staging(plan: Plan) -> None:
             staging.rmdir()
         except OSError:
             pass
+
+
+# ───────────────────────── device registry ─────────────────────────
+
+
+def _dji_completion_dates(volumes: list[Path]) -> list[date]:
+    """All distinct recording dates found across DJI volumes (parsed from filenames)."""
+    dates: set[date] = set()
+    for vol in volumes:
+        for p in vol.rglob("*.wav"):
+            mo = DJI_FILE_RE.search(p.name)
+            if mo:
+                try:
+                    dates.add(datetime.strptime(mo.group(3), "%Y%m%d").date())
+                except ValueError:
+                    pass
+    return sorted(dates)
+
+
+DJI_MIC = Device(
+    name="dji-mic-2",
+    device_class=DJI_DEVICE_CLASS,
+    detect=_dji_volume_detect,
+    discover=discover_clips,
+    filter_by_args=filter_by_args,
+    build_plan=build_plan,
+    completion_dates=_dji_completion_dates,
+)
+
+
+def _sony_volume_detect(vol: Path) -> bool:
+    return False
+
+
+def sony_discover(volumes: list[Path]) -> list:
+    raise NotImplementedError("sony_discover lands in Task 2.5")
+
+
+def sony_filter_by_args(items, args):
+    raise NotImplementedError("sony_filter_by_args lands in Task 2.5")
+
+
+def sony_build_plan(items, args):
+    raise NotImplementedError("sony_build_plan lands in Task 2.6")
+
+
+def sony_completion_dates(volumes):
+    return []
+
+
+SONY_A7C = Device(
+    name="sony-a7c",
+    device_class="SONY-A7C",
+    detect=_sony_volume_detect,
+    discover=sony_discover,
+    filter_by_args=sony_filter_by_args,
+    build_plan=sony_build_plan,
+    completion_dates=sony_completion_dates,
+)
+
+
+def select_device(volumes: list[Path], requested: str) -> Device:
+    """Pick a Device by --device flag value or auto-detect across volumes."""
+    if requested == "dji":
+        return DJI_MIC
+    if requested == "sony":
+        return SONY_A7C
+    for vol in volumes:
+        if DJI_MIC.detect(vol):
+            return DJI_MIC
+        if SONY_A7C.detect(vol):
+            return SONY_A7C
+    sys.exit("media-import: no recognized media device on any mounted volume. "
+             "Pass --device dji|sony explicitly.")
 
 
 # ───────────────────────── completion dispatch ─────────────────────────
