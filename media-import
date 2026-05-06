@@ -317,6 +317,14 @@ def find_dji_volumes() -> list[Path]:
     return [v for v in VOLUMES_GLOB.iterdir() if _dji_volume_detect(v)]
 
 
+def find_all_volumes() -> list[Path]:
+    """All directory entries under /Volumes/, regardless of which device they
+    might be — detection is the device's responsibility (Device.detect)."""
+    if not VOLUMES_GLOB.exists():
+        return []
+    return [v for v in VOLUMES_GLOB.iterdir() if v.is_dir()]
+
+
 def discover_clips(volumes: Iterable[Path]) -> list[Clip]:
     """rglob each volume; parse filenames + WAV headers."""
     clips: list[Clip] = []
@@ -1587,10 +1595,7 @@ def _check_sony_verification() -> None:
 
 def cmd_verify_sony() -> int:
     require_exiftool()
-    if not VOLUMES_GLOB.exists():
-        all_volumes: list[Path] = []
-    else:
-        all_volumes = [v for v in VOLUMES_GLOB.iterdir() if v.is_dir()]
+    all_volumes = find_all_volumes()
     sony_vols = [v for v in all_volumes if SONY_A7C.detect(v)]
     if not sony_vols:
         print("media-import: no Sony A7C card detected on /Volumes/.",
@@ -1727,6 +1732,19 @@ def cmd_complete(kind: str, args: argparse.Namespace) -> int:
     if kind not in ("dates-from", "dates-to", "mics", "versions"):
         return 0
 
+    if kind in ("dates-from", "dates-to"):
+        all_volumes = find_all_volumes()
+        try:
+            device = select_device(all_volumes,
+                                   requested=getattr(args, "ctx_device", "auto") or "auto")
+        except SystemExit:
+            return 0
+        if device is SONY_A7C:
+            relevant = [v for v in all_volumes if device.detect(v)]
+            for d in device.completion_dates(relevant):
+                print(d.isoformat())
+            return 0
+
     vols = find_dji_volumes()
     clips = discover_clips(vols)
     if not clips:
@@ -1807,6 +1825,9 @@ def build_parser() -> argparse.ArgumentParser:
         prog="media-import",
         description="Import audio from DJI Mic 2 transmitters.",
     )
+    p.add_argument("--device", choices=("auto", "dji", "sony"),
+                   default="auto",
+                   help="which device profile to use; 'auto' detects from card content")
     p.add_argument("--dest", type=Path,
                    help="Destination directory (required for actual runs)")
     p.add_argument("--from", dest="from_date", type=parse_iso_date,
@@ -1835,6 +1856,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--__ctx-to", dest="ctx_to", help=argparse.SUPPRESS)
     p.add_argument("--__ctx-mic", dest="ctx_mic", help=argparse.SUPPRESS)
     p.add_argument("--__ctx-version", dest="ctx_version", help=argparse.SUPPRESS)
+    p.add_argument("--__ctx-device", dest="ctx_device", help=argparse.SUPPRESS)
     return p
 
 
@@ -1915,40 +1937,52 @@ def main(argv: list[str] | None = None) -> int:
     if args.dest is None:
         parser.error("--dest is required")
 
+    # Device selection
+    all_volumes = find_all_volumes()
+    device = select_device(all_volumes, requested=args.device)
 
-    # Discovery
-    status("Scanning /Volumes for DJI cards...")
-    volumes = find_dji_volumes()
-    if not volumes:
-        clear_status()
-        sys.stderr.write("error: no DJI cards found at /Volumes/*. "
-                         "Plug in your transmitters and try again.\n")
-        return 2
+    if device is SONY_A7C:
+        require_exiftool()
+        _check_sony_verification()
 
-    vol_names = ", ".join(v.name for v in volumes)
-    status(f"Indexing audio on {len(volumes)} card(s): {vol_names}...")
-    clips_all = discover_clips(volumes)
-    if not clips_all:
-        clear_status()
-        sys.stderr.write("error: connected volumes have no DJI files matching pattern.\n")
-        return 2
+    relevant = [v for v in all_volumes if device.detect(v)]
+    if not relevant:
+        sys.exit(f"media-import: no {device.name} card found.")
 
-    status(f"Found {len(clips_all)} clips · planning import...")
-    resolve_date_range(args, clips_all)
+    # Pre-scan confirmation
+    print(f"Found {device.name} on:", file=sys.stderr)
+    for v in relevant:
+        print(f"  {v}", file=sys.stderr)
+    pre_confirm = input("Proceed? [y/N] ").strip().lower()
+    if pre_confirm != "y":
+        sys.exit("aborted.")
 
-    # Filter by date range, mic, version
-    clips = filter_by_args(clips_all, args)
-    if args.version == "both":
-        # Keep both
-        pass
-    if not clips:
-        clear_status()
-        sys.stderr.write("no clips matched the given filters.\n")
-        return 0
+    # Discovery and plan
+    items_all = device.discover(relevant)
 
-    # Build chains and plan
-    chains = build_chains(clips)
-    plan = build_plan(chains, args)
+    if device is DJI_MIC:
+        # DJI-specific: resolve date range defaults from ALL clips before
+        # filtering, then chain-detect between discover and build_plan.
+        if not items_all:
+            clear_status()
+            sys.stderr.write("error: connected volumes have no DJI files matching pattern.\n")
+            return 2
+        resolve_date_range(args, items_all)
+        items = device.filter_by_args(items_all, args)
+        if not items:
+            clear_status()
+            sys.stderr.write("no clips matched the given filters.\n")
+            return 0
+        chains = build_chains(items)
+        plan = device.build_plan(chains, args)
+    else:
+        items = device.filter_by_args(items_all, args)
+        if not items:
+            clear_status()
+            sys.stderr.write("no media matched the given filters.\n")
+            return 0
+        chains = []
+        plan = device.build_plan(items, args)
 
     # Estimate
     rates = load_rates()
@@ -1959,7 +1993,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Preview
     clear_status()
-    print(format_preview(plan, chains, volumes, args, est))
+    print(format_preview(plan, chains, relevant, args, est))
     print()
 
     if args.dry_run:

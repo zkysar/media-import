@@ -12,6 +12,7 @@ _media-import() {
   typeset -A opt_args
 
   _arguments -C \
+    '--device[Which device profile to use]:device:(auto dji sony)' \
     '--dest[Destination directory]:dest:_files -/' \
     '--from[Earliest recording date]:date: _media_import_complete dates-from' \
     '--to[Latest recording date]:date: _media_import_complete dates-to' \
@@ -24,6 +25,7 @@ _media-import() {
     '--model[Whisper model]:model:_media_import_models' \
     '--yes[Skip confirmation prompt]' \
     '--dry-run[Preview only]' \
+    '--verify-sony[Run Sony A7C real-card verification]' \
     '-h[Show help]' \
     '--help[Show help]'
 }
@@ -51,11 +53,12 @@ _media_import_arg_value() {
 # `media-import --__complete <kind>` via --__ctx-* flags.
 _media_import_complete() {
   local kind=$1
-  local from_val to_val mic_val ver_val
+  local from_val to_val mic_val ver_val device_val
   from_val=$(_media_import_arg_value --from)
   to_val=$(_media_import_arg_value --to)
   mic_val=$(_media_import_arg_value --mic)
   ver_val=$(_media_import_arg_value --version)
+  device_val=$(_media_import_arg_value --device)
 
   # Don't pass the value of the flag currently being completed.
   case "$kind" in
@@ -77,6 +80,9 @@ _media_import_complete() {
   esac
   case "$ver_val" in
     edit|orig|both) ctx_args+=(--__ctx-version "$ver_val") ;;
+  esac
+  case "$device_val" in
+    auto|dji|sony) ctx_args+=(--__ctx-device "$device_val") ;;
   esac
 
   local -a items
