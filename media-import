@@ -37,6 +37,23 @@ ADJACENT_TOLERANCE_S = 2.0
 
 OVERLAP_PROBE_S = 30.0  # initial probe size for overlap detection
 
+# ─────────────────────────── Sony A7C constants ───────────────────────
+
+SONY_DEVICE_CLASS = "SONY-A7C"
+SONY_PHOTOS_CATEGORY = "PHOTOS"
+SONY_VIDEOS_CATEGORY = "VIDEOS"
+
+SONY_STILLS_DIR_RE = re.compile(r"^\d{3}MSDCF$")    # DCIM/<NNN>MSDCF/
+SONY_VIDEO_ROOTS = ("PRIVATE/M4ROOT", "PRIVATE/MP_ROOT")
+SONY_VIDEO_DB_PATHS = (
+    "PRIVATE/M4ROOT/MEDIAPRO.XML",
+    "PRIVATE/M4ROOT/STATUS.BIN",
+    "PRIVATE/M4ROOT/AVF_INFO",
+    "PRIVATE/SONY",
+)
+SONY_STILL_EXTS = {".JPG", ".ARW"}    # HEIF intentionally excluded — user does not shoot it
+SONY_VIDEO_EXTS = {".MP4"}
+
 # Default rate model — used until rate cache has data.
 DEFAULT_RATES = {
     "copy_mb_per_s": 17.0,           # SD-class-10 floor
@@ -1225,6 +1242,20 @@ DJI_MIC = Device(
 
 
 def _sony_volume_detect(vol: Path) -> bool:
+    """True if `vol` looks like a Sony A7C SD card."""
+    if not vol.is_dir():
+        return False
+    dcim = vol / "DCIM"
+    if dcim.is_dir():
+        try:
+            for sub in dcim.iterdir():
+                if SONY_STILLS_DIR_RE.match(sub.name):
+                    return True
+        except (OSError, PermissionError):
+            pass
+    for vid_root in SONY_VIDEO_ROOTS:
+        if (vol / vid_root).is_dir():
+            return True
     return False
 
 
@@ -1246,7 +1277,7 @@ def sony_completion_dates(volumes):
 
 SONY_A7C = Device(
     name="sony-a7c",
-    device_class="SONY-A7C",
+    device_class=SONY_DEVICE_CLASS,
     detect=_sony_volume_detect,
     discover=sony_discover,
     filter_by_args=sony_filter_by_args,

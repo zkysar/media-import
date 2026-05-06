@@ -28,6 +28,35 @@ class DeviceDispatchTest(unittest.TestCase):
         picked = m.select_device([], requested="dji")
         self.assertIs(picked, m.DJI_MIC)
 
+    def test_select_device_auto_returns_sony_for_sony_card(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            vol = Path(tmp)
+            stills = vol / "DCIM" / "100MSDCF"
+            stills.mkdir(parents=True)
+            (stills / "DSC00001.JPG").write_bytes(b"")
+            picked = m.select_device([vol], requested="auto")
+            self.assertIs(picked, m.SONY_A7C)
+
+    def test_select_device_auto_returns_sony_for_video_only_card(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            vol = Path(tmp)
+            (vol / "PRIVATE" / "M4ROOT" / "CLIP").mkdir(parents=True)
+            picked = m.select_device([vol], requested="auto")
+            self.assertIs(picked, m.SONY_A7C)
+
+    def test_select_device_explicit_sony(self):
+        picked = m.select_device([], requested="sony")
+        self.assertIs(picked, m.SONY_A7C)
+
+    def test_sony_detect_rejects_random_dir(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            vol = Path(tmp)
+            (vol / "junk.txt").write_bytes(b"")
+            self.assertFalse(m._sony_volume_detect(vol))
+
 
 if __name__ == "__main__":
     unittest.main()
