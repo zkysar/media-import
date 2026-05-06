@@ -161,11 +161,18 @@ class TranscribeOp:
 
 
 @dataclass
+class AudioExtractOp:
+    src: Path                 # the final video path (e.g. RAW/.../VIDEOS/C0001.MP4)
+    dst: Path                 # the WAV target (e.g. RAW/.../TRANSCRIPTS/C0001.wav)
+
+
+@dataclass
 class Plan:
     copies: list[CopyOp] = field(default_factory=list)
     joins: list[JoinOp] = field(default_factory=list)
     transcribes: list[TranscribeOp] = field(default_factory=list)
     singleton_moves: list[CopyOp] = field(default_factory=list)  # staged → final
+    audio_extracts: list[AudioExtractOp] = field(default_factory=list)
     dest: Path = Path()
     args_summary: dict = field(default_factory=dict)
 
@@ -1178,6 +1185,17 @@ def run_singleton_moves(plan: Plan) -> dict:
     return {"count": moved, "skipped": skipped}
 
 
+def run_audio_extracts(plan: Plan) -> None:
+    """Run each scheduled audio-extract op. Idempotent: if dst already exists
+    with non-zero size, skip."""
+    if not plan.audio_extracts:
+        return
+    for op in plan.audio_extracts:
+        if op.dst.exists() and op.dst.stat().st_size > 0:
+            continue
+        ffmpeg_extract_audio(op.src, op.dst)
+
+
 def run_transcribes(plan: Plan, args: argparse.Namespace, rates: dict) -> dict:
     if not plan.transcribes:
         return {"count": 0, "elapsed": 0.0, "failures": []}
@@ -1501,6 +1519,23 @@ def sony_build_plan(groups: list[SonyGroup],
             plan.copies.append(CopyOp(src=src, dst=staged, size_bytes=src_size))
             plan.singleton_moves.append(CopyOp(src=staged, dst=final,
                                                   size_bytes=src_size))
+
+        if g.kind == "video" and args.transcribe:
+            transcripts_dir = (args.dest / RAW_ROOT
+                                / g.timestamp.date().isoformat()
+                                / SONY_DEVICE_CLASS / g.body_serial
+                                / TRANSCRIPTS_CATEGORY)
+            final_video = target_dir / g.primary.name
+            audio_wav = transcripts_dir / (g.primary.stem + ".wav")
+            srt_path = transcripts_dir / (g.primary.stem + ".srt")
+            if not srt_path.exists():
+                plan.audio_extracts.append(AudioExtractOp(
+                    src=final_video, dst=audio_wav))
+                plan.transcribes.append(TranscribeOp(
+                    audio=audio_wav,
+                    output_dir=transcripts_dir,
+                    duration_s=0.0,
+                ))
 
     plan.args_summary = {
         "dest": str(args.dest),
@@ -2042,6 +2077,7 @@ def main(argv: list[str] | None = None) -> int:
         copy_stats = run_copies(plan, rates)
         join_stats = run_joins(plan, rates)
         move_stats = run_singleton_moves(plan)
+        run_audio_extracts(plan)   # extract video audio for any scheduled transcribe ops
         trans_stats = run_transcribes(plan, args, rates)
     except KeyboardInterrupt:
         print("\ninterrupted; staging left intact for resume on next run.")
