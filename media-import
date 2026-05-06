@@ -169,6 +169,17 @@ class Plan:
 
 
 @dataclass
+class SonyGroup:
+    kind: str               # "photo" or "video"
+    primary: Path           # main file (the JPG for photos, the MP4 for video)
+    files: list[Path]       # all files in the group (primary + sidecars)
+    timestamp: datetime     # from exiftool (DateTimeOriginal or CreateDate)
+    body_serial: str        # from exiftool SerialNumber, "UNKNOWN" if absent
+    size_bytes: int         # sum of all file sizes in the group
+    volume: Path            # the source SD-card volume root
+
+
+@dataclass
 class Device:
     name: str
     device_class: str
@@ -1259,12 +1270,168 @@ def _sony_volume_detect(vol: Path) -> bool:
     return False
 
 
-def sony_discover(volumes: list[Path]) -> list:
-    raise NotImplementedError("sony_discover lands in Task 2.5")
+def _sony_is_db_path(p: Path, vol: Path) -> bool:
+    """True if `p` is a Sony database/firmware artifact that must NOT be copied."""
+    rel = str(p.relative_to(vol))
+    if rel.startswith("PRIVATE/SONY/"):
+        return True
+    for db in SONY_VIDEO_DB_PATHS:
+        if rel == db or rel.startswith(db + "/"):
+            return True
+    if p.suffix.lower() == ".dat" or p.name == "INDEX.BDM":
+        return True
+    return False
 
 
-def sony_filter_by_args(items, args):
-    raise NotImplementedError("sony_filter_by_args lands in Task 2.5")
+_SONY_VIDEO_BASENAME_RE = re.compile(r"^(C\d{4})(?:[MR]\d{2})?$")
+
+
+def _sony_video_basename(name_no_ext: str) -> str:
+    """Strip M01/R01 suffixes so C0001M01 and C0001 group together."""
+    mo = _SONY_VIDEO_BASENAME_RE.match(name_no_ext)
+    return mo.group(1) if mo else name_no_ext
+
+
+def _sony_parse_dt(s: str | None) -> datetime | None:
+    """Parse 'YYYY:MM:DD HH:MM:SS' (exiftool's default with -d format flag)."""
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s, "%Y:%m:%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def sony_discover(volumes: list[Path]) -> list[SonyGroup]:
+    """Scan Sony A7C SD-card volumes; return SonyGroups (one per logical capture).
+
+    Photo groups: same-basename .JPG / .ARW within a DCIM/<NNN>MSDCF/ folder
+    coalesce into one group. The .JPG (when present) is treated as primary.
+
+    Video groups: .MP4 + matching .XML + .THM (basename match after stripping
+    M01/R01 suffix) coalesce. The .MP4 is primary.
+
+    DB / firmware artifacts (MEDIAPRO.XML, STATUS.BIN, AVF_INFO/, PRIVATE/SONY/,
+    .dat files, INDEX.BDM) are skipped — not in any group, never read.
+
+    Groups whose primary's EXIF can't be parsed (no DateTimeOriginal /
+    CreateDate) are dropped — caller can't filter or place them.
+    """
+    stills_by_base: dict[tuple[Path, Path, str], list[Path]] = {}
+    videos_by_basename: dict[tuple[Path, str], list[Path]] = {}
+
+    for vol in volumes:
+        dcim = vol / "DCIM"
+        if dcim.is_dir():
+            for sub in dcim.iterdir():
+                if not SONY_STILLS_DIR_RE.match(sub.name):
+                    continue
+                try:
+                    iter_files = list(sub.iterdir())
+                except (OSError, PermissionError):
+                    continue
+                for f in iter_files:
+                    if not f.is_file():
+                        continue
+                    if f.suffix.upper() not in SONY_STILL_EXTS:
+                        continue
+                    key = (vol, sub, f.stem)
+                    stills_by_base.setdefault(key, []).append(f)
+
+        for vid_root in SONY_VIDEO_ROOTS:
+            for sub_name in ("CLIP", "THMBNL"):
+                d = vol / vid_root / sub_name
+                if not d.is_dir():
+                    continue
+                try:
+                    iter_files = list(d.iterdir())
+                except (OSError, PermissionError):
+                    continue
+                for f in iter_files:
+                    if not f.is_file():
+                        continue
+                    if _sony_is_db_path(f, vol):
+                        continue
+                    base = _sony_video_basename(f.stem)
+                    videos_by_basename.setdefault((vol, base), []).append(f)
+
+    primary_for_still: dict[tuple[Path, Path, str], Path] = {}
+    for key, files in stills_by_base.items():
+        jpg = next((f for f in files if f.suffix.upper() == ".JPG"), None)
+        primary_for_still[key] = jpg or files[0]
+
+    primary_for_video: dict[tuple[Path, str], Path] = {}
+    for key, files in videos_by_basename.items():
+        mp4 = next((f for f in files if f.suffix.upper() == ".MP4"), None)
+        if mp4 is not None:
+            primary_for_video[key] = mp4
+
+    primaries = list(primary_for_still.values()) + list(primary_for_video.values())
+    meta = exiftool_batch(
+        primaries,
+        tags=["DateTimeOriginal", "CreateDate", "SerialNumber"],
+    )
+
+    groups: list[SonyGroup] = []
+
+    for key, files in stills_by_base.items():
+        vol = key[0]
+        primary = primary_for_still[key]
+        rec = meta.get(primary, {})
+        ts = _sony_parse_dt(rec.get("DateTimeOriginal"))
+        if ts is None:
+            continue
+        try:
+            size = sum(f.stat().st_size for f in files)
+        except OSError:
+            continue
+        groups.append(SonyGroup(
+            kind="photo",
+            primary=primary,
+            files=sorted(files),
+            timestamp=ts,
+            body_serial=str(rec.get("SerialNumber") or "UNKNOWN"),
+            size_bytes=size,
+            volume=vol,
+        ))
+
+    for key, files in videos_by_basename.items():
+        if key not in primary_for_video:
+            continue
+        vol = key[0]
+        primary = primary_for_video[key]
+        rec = meta.get(primary, {})
+        ts = _sony_parse_dt(rec.get("CreateDate") or rec.get("DateTimeOriginal"))
+        if ts is None:
+            continue
+        try:
+            size = sum(f.stat().st_size for f in files)
+        except OSError:
+            continue
+        groups.append(SonyGroup(
+            kind="video",
+            primary=primary,
+            files=sorted(files),
+            timestamp=ts,
+            body_serial=str(rec.get("SerialNumber") or "UNKNOWN"),
+            size_bytes=size,
+            volume=vol,
+        ))
+
+    return groups
+
+
+def sony_filter_by_args(groups: list[SonyGroup],
+                         args: argparse.Namespace) -> list[SonyGroup]:
+    out = groups
+    if args.from_date:
+        out = [g for g in out if g.timestamp.date() >= args.from_date]
+    if args.to_date:
+        out = [g for g in out if g.timestamp.date() <= args.to_date]
+    if args.days is not None and args.days > 0:
+        cutoff = (datetime.now() - timedelta(days=args.days)).date()
+        out = [g for g in out if g.timestamp.date() >= cutoff]
+    return out
 
 
 def sony_build_plan(items, args):
