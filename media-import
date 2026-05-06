@@ -462,6 +462,18 @@ def dest_dir_for(dest_root: Path, bucket: date, tx: str, category: str) -> Path:
             / DJI_DEVICE_CLASS / tx / category.upper())
 
 
+def sony_dest_dir_for(dest_root: Path, bucket: date, body_serial: str,
+                      kind: str) -> Path:
+    """Output dir: <dest>/RAW/<date>/SONY-A7C/<body_serial>/<PHOTOS|VIDEOS>/.
+
+    `kind` is "photo" or "video"; mapped to the upper-case PHOTOS/VIDEOS
+    category label used in the path.
+    """
+    category = SONY_PHOTOS_CATEGORY if kind == "photo" else SONY_VIDEOS_CATEGORY
+    return (dest_root / RAW_ROOT / bucket.isoformat()
+            / SONY_DEVICE_CLASS / body_serial / category)
+
+
 def build_plan(chains: list[Chain], args: argparse.Namespace) -> Plan:
     plan = Plan(dest=args.dest)
 
@@ -1434,8 +1446,40 @@ def sony_filter_by_args(groups: list[SonyGroup],
     return out
 
 
-def sony_build_plan(items, args):
-    raise NotImplementedError("sony_build_plan lands in Task 2.6")
+def sony_build_plan(groups: list[SonyGroup],
+                     args: argparse.Namespace) -> Plan:
+    """Build a Plan from Sony groups. Stage → finalize pattern. Idempotent."""
+    plan = Plan(dest=args.dest)
+    staging = args.dest / STAGING_DIR_NAME
+
+    for g in groups:
+        target_dir = sony_dest_dir_for(args.dest, g.timestamp.date(),
+                                         g.body_serial, g.kind)
+        for src in g.files:
+            try:
+                src_size = src.stat().st_size
+            except OSError:
+                continue
+            final = target_dir / src.name
+            try:
+                if final.exists() and final.stat().st_size == src_size:
+                    continue
+            except OSError:
+                pass
+            staged = staging / src.name
+            plan.copies.append(CopyOp(src=src, dst=staged, size_bytes=src_size))
+            plan.singleton_moves.append(CopyOp(src=staged, dst=final,
+                                                  size_bytes=src_size))
+
+    plan.args_summary = {
+        "dest": str(args.dest),
+        "from": args.from_date.isoformat() if args.from_date else None,
+        "to": args.to_date.isoformat() if args.to_date else None,
+        "device": "sony-a7c",
+        "transcribe": args.transcribe,
+        "model": getattr(args, "model", None) if args.transcribe else None,
+    }
+    return plan
 
 
 def sony_completion_dates(volumes):
