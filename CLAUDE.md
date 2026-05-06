@@ -39,4 +39,4 @@ Sony imports are gated behind a one-time `--verify-sony` handshake. This command
 - Plans for this repo live at `~/projects/plans/`, not in-tree (per global CLAUDE.md).
 - Empirical evidence for non-obvious behavior (e.g. TX01 vs TX02 overlap) goes in `verify_overlap_v*.py`. Keep these — they're the receipts behind decisions baked into the script.
 - `media-import` is a single Python file by design. No package split unless functionality genuinely warrants it. The `Device` dataclass + module-level instances keep this honest — Sony's per-device logic lives next to DJI's, not in a separate module.
-- Stdlib only — no pip dependencies for the script itself. `openai-whisper` is the one optional runtime dep, gated behind `--transcribe`.
+- Stdlib only — no pip dependencies for the script itself. `openai-whisper` is the one optional runtime dep, gated behind `--transcribe` (used for both DJI's joined WAV and Sony's video-extracted WAV). `ffmpeg` is used for DJI's chain joining and Sony's audio extraction from video.

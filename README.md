@@ -67,8 +67,12 @@ tradeoff).
 **Date filtering:** `--from`, `--to`, `--days` filter by EXIF `DateTimeOriginal` (stills)
 or `CreateDate` (video).
 
-**Transcription:** Sony video transcription lands in a future commit (P3.x). `--transcribe`
-is currently a no-op for Sony video.
+**Transcription:** `media-import --device sony --transcribe --dest <path>` transcribes video clips.
+For each video, ffmpeg extracts the audio track to a 16kHz mono PCM WAV, then whisper
+transcribes it. Both the extracted WAV and the `.srt` transcript land in `TRANSCRIPTS/`.
+Photos are not transcribed — `--transcribe` only affects video groups. The intermediate
+WAV stays on disk in `TRANSCRIPTS/<clipname>.wav` alongside the `.srt`; it is useful
+for re-runs and audits.
 
 ## Flags
 
@@ -82,7 +86,7 @@ is currently a no-op for Sony video.
 | `--version edit\|orig\|both` | `both` | Which version(s) of each clip to import. (DJI only) |
 | `--mic TX01\|TX02\|all` | `all`      | Filter by transmitter. (DJI only) |
 | `--join` / `--no-join` | `--join`    | Join 30-min auto-split chains. (DJI only) |
-| `--transcribe`        | off          | Transcribe joined files + singletons (skips individual chain members). DJI only for now. |
+| `--transcribe`        | off          | Transcribe joined/singleton files (DJI), or video clips (Sony). For DJI, skips individual chain members. |
 | `--model <name>`      | `tiny`       | Whisper model. Use tab completion to see what's cached. |
 | `--verify-sony`       | off          | One-time verification of Sony import code; required before first real import. |
 | `--yes`               | off          | Skip confirmation prompt. |
