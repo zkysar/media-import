@@ -1,27 +1,27 @@
-#compdef dji-import
+#compdef media-import
 
-# dji-import zsh completion
+# media-import zsh completion
 # Dynamic suggestions (dates, mics, versions, models) come from
-# `dji-import --__complete <kind>` which prints "value:description" lines for
+# `media-import --__complete <kind>` which prints "value:description" lines for
 # _describe. Data-driven flags (--from, --to, --mic, --version) progressively
 # filter each other: each candidate set is computed from clips that pass every
 # *other* currently-set flag.
 
-_dji-import() {
+_media-import() {
   local context state state_descr line
   typeset -A opt_args
 
   _arguments -C \
     '--dest[Destination directory]:dest:_files -/' \
-    '--from[Earliest recording date]:date: _dji_import_complete dates-from' \
-    '--to[Latest recording date]:date: _dji_import_complete dates-to' \
+    '--from[Earliest recording date]:date: _media_import_complete dates-from' \
+    '--to[Latest recording date]:date: _media_import_complete dates-to' \
     '--days[Last N days]:N:' \
-    '--version[Which version to import]:version: _dji_import_complete versions' \
-    '--mic[Which transmitter]:mic: _dji_import_complete mics' \
+    '--version[Which version to import]:version: _media_import_complete versions' \
+    '--mic[Which transmitter]:mic: _media_import_complete mics' \
     '--join[Join auto-split chains (default)]' \
     '--no-join[Do not join auto-split chains]' \
     '--transcribe[Transcribe joined files]' \
-    '--model[Whisper model]:model:_dji_import_models' \
+    '--model[Whisper model]:model:_media_import_models' \
     '--yes[Skip confirmation prompt]' \
     '--dry-run[Preview only]' \
     '-h[Show help]' \
@@ -32,7 +32,7 @@ _dji-import() {
 # Handles both space-separated (--from VALUE) and equals (--from=VALUE) forms.
 # Multiple occurrences → last wins. Tolerates partial / mid-edit values;
 # callers must validate.
-_dji_import_arg_value() {
+_media_import_arg_value() {
   local flag=$1
   local val="" i w
   for (( i = 1; i <= ${#words[@]}; i++ )); do
@@ -48,14 +48,14 @@ _dji_import_arg_value() {
 
 # Dispatcher for data-driven completions. Gathers values of the *other* set
 # flags from $words, validates each, forwards only the valid ones to
-# `dji-import --__complete <kind>` via --__ctx-* flags.
-_dji_import_complete() {
+# `media-import --__complete <kind>` via --__ctx-* flags.
+_media_import_complete() {
   local kind=$1
   local from_val to_val mic_val ver_val
-  from_val=$(_dji_import_arg_value --from)
-  to_val=$(_dji_import_arg_value --to)
-  mic_val=$(_dji_import_arg_value --mic)
-  ver_val=$(_dji_import_arg_value --version)
+  from_val=$(_media_import_arg_value --from)
+  to_val=$(_media_import_arg_value --to)
+  mic_val=$(_media_import_arg_value --mic)
+  ver_val=$(_media_import_arg_value --version)
 
   # Don't pass the value of the flag currently being completed.
   case "$kind" in
@@ -83,7 +83,7 @@ _dji_import_complete() {
   local entry
   while IFS= read -r entry; do
     [[ -n "$entry" ]] && items+=("$entry")
-  done < <(dji-import --__complete "$kind" "${ctx_args[@]}" 2>/dev/null)
+  done < <(media-import --__complete "$kind" "${ctx_args[@]}" 2>/dev/null)
 
   (( ${#items[@]} > 0 )) || return 1
 
@@ -95,15 +95,15 @@ _dji_import_complete() {
   esac
 }
 
-_dji_import_models() {
+_media_import_models() {
   local -a models
   local entry
   while IFS= read -r entry; do
     [[ -n "$entry" ]] && models+=("$entry")
-  done < <(dji-import --__complete models 2>/dev/null)
+  done < <(media-import --__complete models 2>/dev/null)
   if (( ${#models[@]} > 0 )); then
     _describe 'whisper model' models
   fi
 }
 
-_dji-import "$@"
+_media-import "$@"

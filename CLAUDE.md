@@ -1,6 +1,6 @@
-# dji-import
+# media-import
 
-CLI for offloading audio off DJI Mic 2 transmitters. See README.md for user-facing docs.
+CLI for importing media off DJI Mic 2 transmitters and Sony A7C cards. See README.md for user-facing docs.
 
 ## Output layout
 
@@ -22,13 +22,9 @@ Example: `~/Audio/podcast/RAW/2026-05-03/DJI-MICS/TX01/EDIT/TX01_20260503_112250
 
 This shape replaces an earlier `<dest>/<category>/[<date>/]<device>/` layout. The new shape groups a day's shoot into one folder and leaves room for additional device classes without restructuring.
 
-## Future rename
-
-This tool is slated to be renamed `media-import` and expanded to Sony A7C photos/videos. The output layout above is forward-compatible: a Sony import would land at `RAW/<date>/SONY-A7C/<body-serial>/PHOTOS/` and `…/VIDEOS/`. Don't add interim levels that would have to be undone.
-
 ## Conventions
 
 - Plans for this repo live at `~/projects/plans/`, not in-tree (per global CLAUDE.md).
 - Empirical evidence for non-obvious behavior (e.g. TX01 vs TX02 overlap) goes in `verify_overlap_v*.py`. Keep these — they're the receipts behind decisions baked into the script.
-- `dji-import` is a single Python file by design. No package split unless functionality genuinely warrants it.
+- `media-import` is a single Python file by design. No package split unless functionality genuinely warrants it.
 - Stdlib only — no pip dependencies for the script itself. `openai-whisper` is the one optional runtime dep, gated behind `--transcribe`.

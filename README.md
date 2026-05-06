@@ -1,4 +1,4 @@
-# dji-import
+# media-import
 
 CLI for importing audio off DJI Mic 2 transmitters. Filters by date range,
 joins 30-minute auto-split chains into single files (with per-pair byte-exact
@@ -10,7 +10,7 @@ and time estimate before doing anything.
 Plug in both DJI mics, then:
 
 ```sh
-dji-import --dest ~/Audio/podcast-2026-05 --transcribe
+media-import --dest ~/Audio/podcast-2026-05 --transcribe
 ```
 
 The script will:
@@ -22,7 +22,7 @@ The script will:
 5. Wait for `y` to proceed
 6. Copy → join (with overlap trimming) → move singletons → transcribe → cleanup
 
-See `~/projects/plans/2026-05-04-dji-import-design.md` for the full design.
+See `~/projects/plans/2026-05-04-media-import-design.md` for the full design.
 
 ## Flags
 
@@ -106,15 +106,15 @@ exec zsh
 If you want it without the dotfiles flow:
 
 ```sh
-git clone <this-repo> ~/projects/utils/dji-import
-cd ~/projects/utils/dji-import
+git clone <this-repo> ~/projects/utils/media-import
+cd ~/projects/utils/media-import
 make install
 exec zsh
 ```
 
 `make install` symlinks:
-- `~/.local/bin/dji-import` → `dji-import`
-- `~/.zsh/completions/_dji-import` → `completions/_dji-import`
+- `~/.local/bin/media-import` → `media-import`
+- `~/.zsh/completions/_media-import` → `completions/_media-import`
 
 `make uninstall` removes both.
 
