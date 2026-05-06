@@ -151,6 +151,17 @@ class Plan:
     args_summary: dict = field(default_factory=dict)
 
 
+# ─────────────────────────── helpers ────────────────────────────
+
+def require_exiftool() -> None:
+    """Exit with a helpful message if exiftool isn't installed."""
+    if shutil.which("exiftool") is None:
+        sys.exit(
+            "media-import: 'exiftool' not found on PATH.\n"
+            "Sony A7C imports require it. Install with: brew install exiftool"
+        )
+
+
 # ─────────────────────────── WAV parsing ────────────────────────────
 
 

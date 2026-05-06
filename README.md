@@ -135,6 +135,7 @@ All already standard on a developer Mac:
 
 - Python 3.11+ (stdlib only — no pip dependencies)
 - `ffmpeg` on PATH (for trim and concat)
+- `exiftool` on PATH (for Sony A7C metadata reads; install with `brew install exiftool`)
 - `openai-whisper` Python package (only if using `--transcribe`)
 - macOS volume mounting at `/Volumes/*`
 
