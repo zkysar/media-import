@@ -24,19 +24,67 @@ The script will:
 
 See `~/projects/plans/2026-05-04-media-import-design.md` for the full design.
 
+## Sony A7C
+
+To import from a Sony A7C card:
+
+```sh
+media-import --device sony --dest ~/Photos/2026-05
+```
+
+Or rely on auto-detection (works when only one card is mounted):
+
+```sh
+media-import --dest ~/Photos/2026-05
+```
+
+**First-time setup:** Before importing from a real Sony card for the first time, run:
+
+```sh
+media-import --verify-sony
+```
+
+This validates the scan output against the card's actual structure and writes a marker to
+`~/.cache/media-import/sony-verified.json`. Subsequent imports skip this step. (Background: Sony
+code is specified ahead of access to a real card, so the gate prevents incomplete code from
+corrupting an import.)
+
+**Output layout:**
+
+```
+<dest>/RAW/<YYYY-MM-DD>/SONY-A7C/<body-serial>/{PHOTOS,VIDEOS}/
+```
+
+The body serial comes from EXIF `SerialNumber`. If EXIF is unavailable, falls back to
+`UNKNOWN`. Stills and video land in separate folders.
+
+**Sidecars:** `.ARW` alongside `.JPG`, and `.XML`/`.THM` alongside `.MP4` are copied
+verbatim — no transcoding, no skipping.
+
+**HEIF support:** `.HIF` files are intentionally unsupported (complexity vs. use-case
+tradeoff).
+
+**Date filtering:** `--from`, `--to`, `--days` filter by EXIF `DateTimeOriginal` (stills)
+or `CreateDate` (video).
+
+**Transcription:** Sony video transcription lands in a future commit (P3.x). `--transcribe`
+is currently a no-op for Sony video.
+
 ## Flags
 
 | Flag                  | Default      | Notes |
 |-----------------------|--------------|-------|
 | `--dest <path>`       | (required)   | Where files land. See [Output layout](#output-layout). |
-| `--from YYYY-MM-DD`   | earliest     | Filter by recording timestamp from filename. |
+| `--device auto\|dji\|sony` | `auto`  | Choose device. `auto` picks DJI or Sony based on what's mounted. |
+| `--from YYYY-MM-DD`   | earliest     | Filter by recording timestamp from filename (DJI) or EXIF (Sony). |
 | `--to YYYY-MM-DD`     | today        | Inclusive. |
 | `--days N`            |              | Shorthand for `--from <N days ago>`; mutually exclusive with `--from`/`--to`. |
-| `--version edit\|orig\|both` | `both` | Which version(s) of each clip to import. |
-| `--mic TX01\|TX02\|all` | `all`      | Filter by transmitter. |
-| `--join` / `--no-join` | `--join`    | Join 30-min auto-split chains. |
-| `--transcribe`        | off          | Transcribe joined files + singletons (skips individual chain members). |
+| `--version edit\|orig\|both` | `both` | Which version(s) of each clip to import. (DJI only) |
+| `--mic TX01\|TX02\|all` | `all`      | Filter by transmitter. (DJI only) |
+| `--join` / `--no-join` | `--join`    | Join 30-min auto-split chains. (DJI only) |
+| `--transcribe`        | off          | Transcribe joined files + singletons (skips individual chain members). DJI only for now. |
 | `--model <name>`      | `tiny`       | Whisper model. Use tab completion to see what's cached. |
+| `--verify-sony`       | off          | One-time verification of Sony import code; required before first real import. |
 | `--yes`               | off          | Skip confirmation prompt. |
 | `--dry-run`           | off          | Preview only. |
 
@@ -53,16 +101,18 @@ Once installed, tab completion provides:
 ## Output layout
 
 ```
-<dest>/RAW/<YYYY-MM-DD>/DJI-MICS/<TX>/<CATEGORY>/
+<dest>/RAW/<YYYY-MM-DD>/<DEVICE-CLASS>/<DEVICE>/<CATEGORY>/
 ```
 
 - `RAW/` — top-level marker for raw offload. Always present.
-- `<YYYY-MM-DD>` — recording date from the filename. Always present.
-- `DJI-MICS/` — device-class folder. Reserved so future classes (e.g. `SONY-A7C`) sit alongside.
-- `<TX>` — `TX01` / `TX02`.
-- `<CATEGORY>` — `EDIT`, `ORIG`, or `TRANSCRIPTS`.
+- `<YYYY-MM-DD>` — recording date from the filename (DJI) or EXIF (Sony). Always present.
+- `<DEVICE-CLASS>` — `DJI-MICS` or `SONY-A7C`.
+- `<DEVICE>` — `TX01` / `TX02` (DJI), or body serial (Sony).
+- `<CATEGORY>` — `EDIT`, `ORIG`, `TRANSCRIPTS` (DJI), or `PHOTOS`, `VIDEOS` (Sony).
 
-Example: `~/Audio/podcast/RAW/2026-05-03/DJI-MICS/TX01/EDIT/TX01_20260503_112250_140603_edit_joined.wav`
+Example (DJI): `~/Audio/podcast/RAW/2026-05-03/DJI-MICS/TX01/EDIT/TX01_20260503_112250_140603_edit_joined.wav`
+
+Example (Sony): `~/Photos/2026-05/RAW/2026-05-03/SONY-A7C/0123456789/PHOTOS/DSC01234.ARW`
 
 ## Auto-split detection
 
