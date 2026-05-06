@@ -54,6 +54,7 @@ SONY_VIDEO_DB_PATHS = (
 SONY_STILL_EXTS = {".JPG", ".ARW"}    # HEIF intentionally excluded — user does not shoot it
 SONY_VIDEO_EXTS = {".MP4"}
 SONY_DATE_CACHE_DIR = Path.home() / ".cache" / "media-import" / "sony-dates"
+SONY_VERIFICATION_PATH = Path.home() / ".cache" / "media-import" / "sony-verified.json"
 
 # Default rate model — used until rate cache has data.
 DEFAULT_RATES = {
@@ -1572,6 +1573,87 @@ SONY_A7C = Device(
 )
 
 
+def _check_sony_verification() -> None:
+    if not SONY_VERIFICATION_PATH.exists():
+        sys.exit(
+            "media-import: Sony A7C import is gated behind a one-time real-card\n"
+            "verification step.\n"
+            "  1. Insert your Sony A7C SD card.\n"
+            "  2. Run: media-import --verify-sony\n"
+            "  3. Confirm the scan output looks correct.\n"
+            "After that, normal `--device sony` invocations will work."
+        )
+
+
+def cmd_verify_sony() -> int:
+    require_exiftool()
+    if not VOLUMES_GLOB.exists():
+        all_volumes: list[Path] = []
+    else:
+        all_volumes = [v for v in VOLUMES_GLOB.iterdir() if v.is_dir()]
+    sony_vols = [v for v in all_volumes if SONY_A7C.detect(v)]
+    if not sony_vols:
+        print("media-import: no Sony A7C card detected on /Volumes/.",
+              file=sys.stderr)
+        return 1
+    print("Detected Sony A7C card(s):", file=sys.stderr)
+    for v in sony_vols:
+        print(f"  {v}", file=sys.stderr)
+    groups = sony_discover(sony_vols)
+    if not groups:
+        print("media-import: scan returned 0 groups. Aborting verification.",
+              file=sys.stderr)
+        return 1
+    photo_count = sum(1 for g in groups if g.kind == "photo")
+    video_count = sum(1 for g in groups if g.kind == "video")
+    print(f"\nFound {len(groups)} groups: "
+          f"{photo_count} photo, {video_count} video.", file=sys.stderr)
+    print("\nSample groups (first 5):", file=sys.stderr)
+    for g in groups[:5]:
+        print(f"  [{g.kind}] {g.timestamp.isoformat()} body={g.body_serial}",
+              file=sys.stderr)
+        for f in g.files:
+            try:
+                rel = f.relative_to(g.volume)
+            except ValueError:
+                rel = f
+            try:
+                size = f.stat().st_size
+            except OSError:
+                size = 0
+            print(f"    {rel} ({size} bytes)", file=sys.stderr)
+    serials = sorted({g.body_serial for g in groups})
+    dates = sorted({g.timestamp.date() for g in groups})
+    print(f"\nBody serial(s) seen: {serials}", file=sys.stderr)
+    if dates:
+        print(f"Date range: {dates[0]} to {dates[-1]}", file=sys.stderr)
+    confirm = input("\nDoes this look correct? [y/N] ").strip().lower()
+    if confirm != "y":
+        print("Verification not recorded.", file=sys.stderr)
+        return 1
+    SONY_VERIFICATION_PATH.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "verified_at": datetime.now().isoformat(),
+        "body_serials": serials,
+        "sample_groups": [
+            {"kind": g.kind,
+             "timestamp": g.timestamp.isoformat(),
+             "body_serial": g.body_serial,
+             "files": [str(f.relative_to(g.volume))
+                       if g.volume in f.parents or f == g.volume
+                       else str(f)
+                       for f in g.files]}
+            for g in groups[:10]
+        ],
+    }
+    with open(SONY_VERIFICATION_PATH, "w") as f:
+        json.dump(record, f, indent=2)
+    print(f"\nVerification recorded at {SONY_VERIFICATION_PATH}.",
+          file=sys.stderr)
+    print("Sony imports are now unlocked.", file=sys.stderr)
+    return 0
+
+
 def select_device(volumes: list[Path], requested: str) -> Device:
     """Pick a Device by --device flag value or auto-detect across volumes."""
     if requested == "dji":
@@ -1737,6 +1819,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mic", choices=("TX01", "TX02", "all"), default="all")
     p.add_argument("--join", dest="join", action="store_true", default=True)
     p.add_argument("--no-join", dest="join", action="store_false")
+    p.add_argument("--verify-sony", action="store_true",
+                   help="run Sony A7C real-card verification (one-time setup)")
     p.add_argument("--transcribe", action="store_true",
                    help="Transcribe joined files via whisper")
     p.add_argument("--model", default="tiny",
@@ -1819,6 +1903,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.complete_kind:
         return cmd_complete(args.complete_kind, args)
+
+    if args.verify_sony:
+        return cmd_verify_sony()
 
     validate_runtime()
     if args.transcribe:
