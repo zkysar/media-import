@@ -173,6 +173,34 @@ def require_exiftool() -> None:
         )
 
 
+def exiftool_batch(paths: list[Path], tags: list[str]) -> dict[Path, dict]:
+    """Call exiftool once on N paths, return {Path: {tag: value, ...}}.
+
+    Empty `paths` → empty dict (no subprocess invocation).
+    Nonzero exit or unparsable output → empty dict (caller decides fallback).
+    Per-file missing tags are simply absent from that path's record.
+    """
+    if not paths:
+        return {}
+    cmd = ["exiftool", "-j", "-d", "%Y:%m:%d %H:%M:%S"]
+    for t in tags:
+        cmd.append(f"-{t}")
+    cmd.extend(str(p) for p in paths)
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return {}
+    try:
+        records = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return {}
+    out: dict[Path, dict] = {}
+    for rec in records:
+        src = rec.pop("SourceFile", None)
+        if src:
+            out[Path(src)] = rec
+    return out
+
+
 # ─────────────────────────── WAV parsing ────────────────────────────
 
 
