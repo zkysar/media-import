@@ -56,6 +56,26 @@ SONY_VIDEO_EXTS = {".MP4"}
 SONY_DATE_CACHE_DIR = Path.home() / ".cache" / "media-import" / "sony-dates"
 SONY_VERIFICATION_PATH = Path.home() / ".cache" / "media-import" / "sony-verified.json"
 
+# ─────────────────────────── DJI Mavic Air 2 constants ───────────────────────
+
+DJI_AIR_DEVICE_CLASS = "DJI-DRONES"   # plural per output-layout convention
+FLIGHTLOGS_DIR_NAME = "FLIGHTLOGS"    # sibling to RAW/, holds per-card-session dji.gis files
+
+# DCIM/<NNN>MEDIA/ — DJI's still+video folder. NNN is a 3-digit folder counter.
+_DJI_AIR_DCIM_DIR_RE = re.compile(r"^(\d{3})MEDIA$")
+
+# DJI_NNNN.{JPG,MP4} — DJI uses a single flat counter across stills and video.
+_DJI_AIR_FILE_RE = re.compile(r"^(DJI_\d{4})\.(JPG|MP4)$", re.IGNORECASE)
+
+# Video sidecars live in MISC/THM/<NNN>/ alongside the matching DCIM folder
+# number. .THM is a 160x90 thumbnail; .SCR is a 960x540 preview JPEG.
+_DJI_AIR_SIDECAR_RE = re.compile(r"^(DJI_\d{4})\.(THM|SCR)$", re.IGNORECASE)
+
+# Flight log: per-card-session, accumulates across sessions. Path is fixed.
+_DJI_AIR_GIS_REL = ("MISC", "GIS", "dji.gis")
+
+DJI_AIR_DATE_CACHE_DIR = Path.home() / ".cache" / "media-import" / "dji-air-dates"
+
 # Default rate model — used until rate cache has data.
 DEFAULT_RATES = {
     "copy_mb_per_s": 17.0,           # SD-class-10 floor
@@ -143,6 +163,13 @@ class CopyOp:
     src: Path
     dst: Path
     size_bytes: int
+    # True when dst already exists with a *different* size and we intend to
+    # replace it. Same-size existing dsts are skipped before reaching here.
+    # Surfaced in the preview so the user knows what's about to be clobbered.
+    overwrite_existing: bool = False
+    # Pre-existing dst size, captured at plan time for preview display.
+    # Only meaningful when overwrite_existing is True.
+    existing_size_bytes: int = 0
 
 
 @dataclass
@@ -176,22 +203,47 @@ class Plan:
     dest: Path = Path()
     args_summary: dict = field(default_factory=dict)
 
+    @property
+    def overwrites(self) -> list[CopyOp]:
+        """Singleton moves that will replace an existing file with one of a
+        different size. Shown in the preview so the user can see what's
+        about to be clobbered before confirming."""
+        return [op for op in self.singleton_moves if op.overwrite_existing]
+
 
 @dataclass
-class SonyGroup:
-    kind: str               # "photo" or "video"
-    primary: Path           # main file (the JPG for photos, the MP4 for video)
+class MediaGroup:
+    """One logical capture as discovered on a card.
+
+    Used by every device whose imports are per-clip-with-sidecars (Sony A7C,
+    DJI Mavic Air 2, …). DJI Mic stays on Clip/Chain because its chain
+    detection is mic-specific.
+
+    `kind` values currently in use:
+      "photo"     — still image group (primary JPG/ARW, possibly siblings)
+      "video"     — moving image group (primary MP4 + .THM/.SCR/.XML sidecars)
+      "flightlog" — per-card artifact not tied to a single capture
+                    (e.g. DJI's MISC/GIS/dji.gis). Routed off the
+                    RAW/<date>/DEVICE-CLASS/ tree by build_plan.
+    """
+    kind: str
+    primary: Path           # main file (JPG for photos, MP4 for video, .gis for flightlog)
     files: list[Path]       # all files in the group (primary + sidecars)
-    timestamp: datetime     # from exiftool (DateTimeOriginal or CreateDate)
+    timestamp: datetime     # from exiftool / file mtime
     body_serial: str        # from exiftool SerialNumber, "UNKNOWN" if absent
     size_bytes: int         # sum of all file sizes in the group
     volume: Path            # the source SD-card volume root
+
+
+# Backwards-compat alias — older callers / tests may still import SonyGroup.
+SonyGroup = MediaGroup
 
 
 @dataclass
 class Device:
     name: str
     device_class: str
+    supports_transcribe: bool
     detect: Callable[[Path], bool]
     discover: Callable[[list[Path]], list]
     filter_by_args: Callable[[list, argparse.Namespace], list]
@@ -479,6 +531,30 @@ def dest_dir_for(dest_root: Path, bucket: date, tx: str, category: str) -> Path:
             / DJI_DEVICE_CLASS / tx / category.upper())
 
 
+def classify_dst(final: Path, expected_size: int) -> tuple[bool, int] | None:
+    """Inspect a planned final destination at plan time.
+
+    Returns:
+      None         — dst exists with matching size; caller should skip the op.
+      (False, 0)   — dst does not exist; normal new-file copy.
+      (True, n)    — dst exists with a *different* size (n bytes); the op
+                     should be flagged as overwrite_existing so the preview
+                     can list it and run_singleton_moves knows to replace.
+
+    Per CLAUDE.md "overwrite policy": exact byte-size match → skip;
+    different size → flag and surface to the user before clobbering.
+    """
+    try:
+        if final.exists():
+            existing = final.stat().st_size
+            if existing == expected_size:
+                return None
+            return (True, existing)
+    except OSError:
+        pass
+    return (False, 0)
+
+
 def sony_dest_dir_for(dest_root: Path, bucket: date, body_serial: str,
                       kind: str) -> Path:
     """Output dir: <dest>/RAW/<date>/SONY-A7C/<body_serial>/<PHOTOS|VIDEOS>/.
@@ -506,15 +582,19 @@ def build_plan(chains: list[Chain], args: argparse.Namespace) -> Plan:
             # Stage and move (or just leave as singletons).
             for c in chain.clips:
                 final = target_dir / c.path.name
-                # Idempotency: if dest exists with right size, skip the copy.
-                if final.exists() and final.stat().st_size == c.size_bytes:
-                    pass
+                classification = classify_dst(final, c.size_bytes)
+                if classification is None:
+                    pass   # already present at correct size
                 else:
+                    overwrite, existing_size = classification
                     staged = staging / c.path.name
                     plan.copies.append(CopyOp(src=c.path, dst=staged,
                                               size_bytes=c.size_bytes))
-                    plan.singleton_moves.append(CopyOp(src=staged, dst=final,
-                                                        size_bytes=c.size_bytes))
+                    plan.singleton_moves.append(CopyOp(
+                        src=staged, dst=final, size_bytes=c.size_bytes,
+                        overwrite_existing=overwrite,
+                        existing_size_bytes=existing_size,
+                    ))
                 # Transcribe singletons too (full recordings, not chain pieces).
                 if args.transcribe:
                     srt_path = transcripts_dir / (final.stem + ".srt")
@@ -692,16 +772,19 @@ def fmt_audio_duration(seconds: float) -> str:
 
 
 def format_preview(plan: Plan, chains: list[Chain], volumes: list[Path],
-                    args: argparse.Namespace, est: dict) -> str:
+                    args: argparse.Namespace, est: dict,
+                    device: 'Device') -> str:
     lines: list[str] = []
-    lines.append("DJI Import Preview")
+    lines.append(f"Import Preview ({device.name})")
     lines.append("─" * 64)
 
-    vol_tx: dict[Path, set[str]] = {}
-    for ch in chains:
-        for c in ch.clips:
-            vol_tx.setdefault(c.volume, set()).add(c.tx)
-    if vol_tx:
+    # Source line: DJI mic shows per-volume tx labels; other devices just the
+    # volume paths (group-shaped devices don't have a tx-equivalent label).
+    if chains:
+        vol_tx: dict[Path, set[str]] = {}
+        for ch in chains:
+            for c in ch.clips:
+                vol_tx.setdefault(c.volume, set()).add(c.tx)
         src_summary = ", ".join(
             f"{v} ({','.join(sorted(txs))})"
             for v, txs in sorted(vol_tx.items())
@@ -710,65 +793,105 @@ def format_preview(plan: Plan, chains: list[Chain], volumes: list[Path],
         src_summary = ", ".join(str(v) for v in volumes)
     lines.append(f"Source:  {src_summary}")
     lines.append(f"Dest:    {plan.dest}")
-    range_str = f"{args.from_date.isoformat() if args.from_date else '(earliest)'} → {args.to_date.isoformat() if args.to_date else '(today)'}"
-    lines.append(f"Range:   {range_str}  (filter: filename timestamp)")
-    lines.append(f"Version: {args.version}")
-    if args.mic != "all":
-        lines.append(f"Mic:     {args.mic}")
+    range_str = (
+        f"{args.from_date.isoformat() if args.from_date else '(earliest)'} → "
+        f"{args.to_date.isoformat() if args.to_date else '(today)'}"
+    )
+    lines.append(f"Range:   {range_str}")
+    if device is DJI_MIC:
+        lines.append(f"Version: {args.version}")
+        if args.mic != "all":
+            lines.append(f"Mic:     {args.mic}")
     lines.append("")
 
-    # Per-(tx,version) summary
-    by_tx: dict[str, dict[str, list[Chain]]] = {}
-    for ch in chains:
-        by_tx.setdefault(ch.tx, {}).setdefault(ch.version, []).append(ch)
+    if chains:
+        # DJI-mic-specific: clips/chains/joins
+        by_tx: dict[str, dict[str, list[Chain]]] = {}
+        for ch in chains:
+            by_tx.setdefault(ch.tx, {}).setdefault(ch.version, []).append(ch)
 
-    total_clips = sum(len(ch.clips) for ch in chains)
-    total_audio_s = sum(sum(c.wav.duration_s for c in ch.clips) for ch in chains)
-    total_size = sum(sum(c.size_bytes for c in ch.clips) for ch in chains)
-    lines.append(f"Clips matched: {total_clips} ({fmt_audio_duration(total_audio_s)} audio · {fmt_size(total_size)})")
-    for tx in sorted(by_tx):
-        for v in sorted(by_tx[tx]):
-            chs = by_tx[tx][v]
-            n_clips = sum(len(ch.clips) for ch in chs)
-            audio_s = sum(sum(c.wav.duration_s for c in ch.clips) for ch in chs)
-            size_b = sum(sum(c.size_bytes for c in ch.clips) for ch in chs)
-            n_chains = sum(1 for ch in chs if not ch.is_singleton)
-            n_single = sum(1 for ch in chs if ch.is_singleton)
-            chain_str = ""
-            if n_chains:
-                chain_str += f" · {n_chains} auto-split chain{'s' if n_chains != 1 else ''}"
-            if n_single:
-                chain_str += f" · {n_single} singleton{'s' if n_single != 1 else ''}"
-            lines.append(f"  {tx}/{v.upper()}: {n_clips} clips · {fmt_audio_duration(audio_s)} · {fmt_size(size_b)}{chain_str}")
-    lines.append("")
+        total_clips = sum(len(ch.clips) for ch in chains)
+        total_audio_s = sum(sum(c.wav.duration_s for c in ch.clips) for ch in chains)
+        total_size = sum(sum(c.size_bytes for c in ch.clips) for ch in chains)
+        lines.append(f"Clips matched: {total_clips} "
+                     f"({fmt_audio_duration(total_audio_s)} audio · "
+                     f"{fmt_size(total_size)})")
+        for tx in sorted(by_tx):
+            for v in sorted(by_tx[tx]):
+                chs = by_tx[tx][v]
+                n_clips = sum(len(ch.clips) for ch in chs)
+                audio_s = sum(sum(c.wav.duration_s for c in ch.clips) for ch in chs)
+                size_b = sum(sum(c.size_bytes for c in ch.clips) for ch in chs)
+                n_chains = sum(1 for ch in chs if not ch.is_singleton)
+                n_single = sum(1 for ch in chs if ch.is_singleton)
+                chain_str = ""
+                if n_chains:
+                    chain_str += f" · {n_chains} auto-split chain{'s' if n_chains != 1 else ''}"
+                if n_single:
+                    chain_str += f" · {n_single} singleton{'s' if n_single != 1 else ''}"
+                lines.append(f"  {tx}/{v.upper()}: {n_clips} clips · "
+                             f"{fmt_audio_duration(audio_s)} · "
+                             f"{fmt_size(size_b)}{chain_str}")
+        lines.append("")
 
-    # Joins
-    if plan.joins:
-        lines.append(f"Joins planned: {len(plan.joins)}")
-        for jo in plan.joins:
-            audio_s = sum(c.wav.duration_s for c in jo.chain.clips)
-            lines.append(f"  • {jo.chain.tx} {jo.chain.version}: "
-                         f"{len(jo.chain.clips)} clips → {jo.output.name}  "
-                         f"({fmt_audio_duration(audio_s)})")
+        if plan.joins:
+            lines.append(f"Joins planned: {len(plan.joins)}")
+            for jo in plan.joins:
+                audio_s = sum(c.wav.duration_s for c in jo.chain.clips)
+                lines.append(f"  • {jo.chain.tx} {jo.chain.version}: "
+                             f"{len(jo.chain.clips)} clips → {jo.output.name}  "
+                             f"({fmt_audio_duration(audio_s)})")
+        else:
+            lines.append("Joins planned: 0")
+        lines.append("")
     else:
-        lines.append("Joins planned: 0")
-    lines.append("")
+        # Group-shaped devices (Sony, drone): bucket singleton_moves by their
+        # destination category folder name (PHOTOS / VIDEOS / FLIGHTLOGS / …).
+        # Reads the truth from `plan` rather than re-deriving from groups.
+        by_category: dict[str, list[CopyOp]] = {}
+        for op in plan.singleton_moves:
+            by_category.setdefault(op.dst.parent.name, []).append(op)
+        total_files = len(plan.singleton_moves)
+        total_size = sum(op.size_bytes for op in plan.singleton_moves)
+        lines.append(f"Files matched: {total_files} ({fmt_size(total_size)})")
+        for cat in sorted(by_category):
+            ops = by_category[cat]
+            size = sum(op.size_bytes for op in ops)
+            lines.append(f"  {cat}: {len(ops)} files · {fmt_size(size)}")
+        lines.append("")
 
-    # Transcribe
-    if args.transcribe and plan.transcribes:
-        total_t = sum(op.duration_s for op in plan.transcribes)
-        n_joined_t = sum(1 for op in plan.transcribes
-                         if "_joined.wav" in op.audio.name)
-        n_single_t = len(plan.transcribes) - n_joined_t
-        lines.append(f"Transcribe: enabled (model={args.model}, lang=en)")
-        lines.append(f"  Targets: {len(plan.transcribes)} files "
-                     f"({n_joined_t} joined, {n_single_t} singletons)")
-        lines.append(f"  Total audio: {fmt_audio_duration(total_t)}")
-    elif args.transcribe:
-        lines.append("Transcribe: enabled but no joined files to transcribe")
-    else:
-        lines.append("Transcribe: disabled")
-    lines.append("")
+    # Transcribe — only mention for devices that support it. Suppressed for
+    # drone (Device.supports_transcribe=False) since the section would be
+    # noise; the CLI already rejects --transcribe at dispatch.
+    if device.supports_transcribe:
+        if args.transcribe and plan.transcribes:
+            total_t = sum(op.duration_s for op in plan.transcribes)
+            n_joined_t = sum(1 for op in plan.transcribes
+                             if "_joined.wav" in op.audio.name)
+            n_single_t = len(plan.transcribes) - n_joined_t
+            lines.append(f"Transcribe: enabled (model={args.model}, lang=en)")
+            lines.append(f"  Targets: {len(plan.transcribes)} files "
+                         f"({n_joined_t} joined, {n_single_t} singletons)")
+            lines.append(f"  Total audio: {fmt_audio_duration(total_t)}")
+        elif args.transcribe:
+            lines.append("Transcribe: enabled but no targets to transcribe")
+        else:
+            lines.append("Transcribe: disabled")
+        lines.append("")
+
+    # Overwrites — surface BEFORE output layout so the user sees the warning
+    # next to the confirm prompt rather than buried below disk-space numbers.
+    if plan.overwrites:
+        lines.append(f"⚠ Overwrites: {len(plan.overwrites)} existing files "
+                     f"will be replaced")
+        for op in plan.overwrites[:10]:
+            lines.append(
+                f"  • {op.dst}  "
+                f"({fmt_size(op.existing_size_bytes)} → {fmt_size(op.size_bytes)})"
+            )
+        if len(plan.overwrites) > 10:
+            lines.append(f"  ... and {len(plan.overwrites) - 10} more")
+        lines.append("")
 
     # Output layout (high-level)
     lines.append("Output layout:")
@@ -1156,23 +1279,33 @@ def run_singleton_moves(plan: Plan) -> dict:
 
     moved = 0
     skipped = 0
+    overwritten = 0
     for i, op in enumerate(plan.singleton_moves):
         op.dst.parent.mkdir(parents=True, exist_ok=True)
         if op.dst.exists():
             try:
-                if op.dst.stat().st_size == op.size_bytes:
-                    skipped += 1
-                    # remove stale staged copy
-                    if op.src.exists():
-                        op.src.unlink()
-                    progress.update(set_done=i + 1)
-                    continue
-                else:
-                    raise RuntimeError(
-                        f"destination exists with different size: {op.dst}"
-                    )
+                existing_size = op.dst.stat().st_size
             except OSError as e:
                 raise RuntimeError(f"cannot stat existing dest {op.dst}: {e}")
+            if existing_size == op.size_bytes:
+                skipped += 1
+                if op.src.exists():
+                    op.src.unlink()
+                progress.update(set_done=i + 1)
+                continue
+            if op.overwrite_existing:
+                if not op.src.exists():
+                    progress.update(set_done=i + 1)
+                    continue
+                os.replace(op.src, op.dst)   # atomic overwrite
+                overwritten += 1
+                progress.update(set_done=i + 1)
+                continue
+            raise RuntimeError(
+                f"destination exists with different size and was not flagged "
+                f"for overwrite: {op.dst} "
+                f"(existing={existing_size}, expected={op.size_bytes})"
+            )
         if not op.src.exists():
             # staged source missing — likely already moved on a previous run
             progress.update(set_done=i + 1)
@@ -1182,7 +1315,7 @@ def run_singleton_moves(plan: Plan) -> dict:
         progress.update(set_done=i + 1)
 
     progress.finish()
-    return {"count": moved, "skipped": skipped}
+    return {"count": moved, "skipped": skipped, "overwritten": overwritten}
 
 
 def run_audio_extracts(plan: Plan) -> None:
@@ -1305,6 +1438,7 @@ def _dji_completion_dates(volumes: list[Path]) -> list[date]:
 DJI_MIC = Device(
     name="dji-mic-2",
     device_class=DJI_DEVICE_CLASS,
+    supports_transcribe=True,
     detect=_dji_volume_detect,
     discover=discover_clips,
     filter_by_args=filter_by_args,
@@ -1363,7 +1497,7 @@ def _sony_parse_dt(s: str | None) -> datetime | None:
         return None
 
 
-def sony_discover(volumes: list[Path]) -> list[SonyGroup]:
+def sony_discover(volumes: list[Path]) -> list[MediaGroup]:
     """Scan Sony A7C SD-card volumes; return SonyGroups (one per logical capture).
 
     Photo groups: same-basename .JPG / .ARW within a DCIM/<NNN>MSDCF/ folder
@@ -1433,7 +1567,7 @@ def sony_discover(volumes: list[Path]) -> list[SonyGroup]:
         tags=["DateTimeOriginal", "CreateDate", "SerialNumber"],
     )
 
-    groups: list[SonyGroup] = []
+    groups: list[MediaGroup] = []
 
     for key, files in stills_by_base.items():
         vol = key[0]
@@ -1446,7 +1580,7 @@ def sony_discover(volumes: list[Path]) -> list[SonyGroup]:
             size = sum(f.stat().st_size for f in files)
         except OSError:
             continue
-        groups.append(SonyGroup(
+        groups.append(MediaGroup(
             kind="photo",
             primary=primary,
             files=sorted(files),
@@ -1469,7 +1603,7 @@ def sony_discover(volumes: list[Path]) -> list[SonyGroup]:
             size = sum(f.stat().st_size for f in files)
         except OSError:
             continue
-        groups.append(SonyGroup(
+        groups.append(MediaGroup(
             kind="video",
             primary=primary,
             files=sorted(files),
@@ -1482,8 +1616,8 @@ def sony_discover(volumes: list[Path]) -> list[SonyGroup]:
     return groups
 
 
-def sony_filter_by_args(groups: list[SonyGroup],
-                         args: argparse.Namespace) -> list[SonyGroup]:
+def sony_filter_by_args(groups: list[MediaGroup],
+                         args: argparse.Namespace) -> list[MediaGroup]:
     out = groups
     if args.from_date:
         out = [g for g in out if g.timestamp.date() >= args.from_date]
@@ -1495,7 +1629,7 @@ def sony_filter_by_args(groups: list[SonyGroup],
     return out
 
 
-def sony_build_plan(groups: list[SonyGroup],
+def sony_build_plan(groups: list[MediaGroup],
                      args: argparse.Namespace) -> Plan:
     """Build a Plan from Sony groups. Stage → finalize pattern. Idempotent."""
     plan = Plan(dest=args.dest)
@@ -1510,15 +1644,17 @@ def sony_build_plan(groups: list[SonyGroup],
             except OSError:
                 continue
             final = target_dir / src.name
-            try:
-                if final.exists() and final.stat().st_size == src_size:
-                    continue
-            except OSError:
-                pass
+            classification = classify_dst(final, src_size)
+            if classification is None:
+                continue   # dst already present at correct size
+            overwrite, existing_size = classification
             staged = staging / src.name
             plan.copies.append(CopyOp(src=src, dst=staged, size_bytes=src_size))
-            plan.singleton_moves.append(CopyOp(src=staged, dst=final,
-                                                  size_bytes=src_size))
+            plan.singleton_moves.append(CopyOp(
+                src=staged, dst=final, size_bytes=src_size,
+                overwrite_existing=overwrite,
+                existing_size_bytes=existing_size,
+            ))
 
         if g.kind == "video" and args.transcribe:
             transcripts_dir = (args.dest / RAW_ROOT
@@ -1629,12 +1765,311 @@ def _save_sony_date_cache(p: Path, sig: str, dates: list[str]) -> None:
 SONY_A7C = Device(
     name="sony-a7c",
     device_class=SONY_DEVICE_CLASS,
+    supports_transcribe=True,
     detect=_sony_volume_detect,
     discover=sony_discover,
     filter_by_args=sony_filter_by_args,
     build_plan=sony_build_plan,
     completion_dates=sony_completion_dates,
 )
+
+
+# ─────────────────────────── DJI Mavic Air 2 device ───────────────────────
+
+
+def _dji_air_volume_detect(vol: Path) -> bool:
+    """True if `vol` looks like a DJI drone SD card.
+
+    Accepts either DCIM/<NNN>MEDIA/ with at least one DJI_NNNN.{JPG,MP4},
+    or a flight-log artifact at MISC/GIS/dji.gis (cards offloaded after
+    deletion may still carry the log).
+    """
+    if not vol.is_dir():
+        return False
+    dcim = vol / "DCIM"
+    if dcim.is_dir():
+        try:
+            for sub in dcim.iterdir():
+                if not _DJI_AIR_DCIM_DIR_RE.match(sub.name):
+                    continue
+                try:
+                    for f in sub.iterdir():
+                        if f.is_file() and _DJI_AIR_FILE_RE.match(f.name):
+                            return True
+                except (OSError, PermissionError):
+                    continue
+        except (OSError, PermissionError):
+            pass
+    if (vol / Path(*_DJI_AIR_GIS_REL)).is_file():
+        return True
+    return False
+
+
+def dji_air_discover(volumes: list[Path]) -> list[MediaGroup]:
+    """Scan DJI drone volumes; return one MediaGroup per logical capture
+    plus one "flightlog" group per card.
+
+    Photo groups: a single DJI_NNNN.JPG today (ARW would coalesce by basename
+    if/when we ever shoot RAW). Video groups: DJI_NNNN.MP4 + matching .THM
+    + .SCR sidecars from MISC/THM/<NNN>/.
+
+    Body serial: from EXIF on JPGs (drone serial is constant per body).
+    MP4-only volumes inherit the per-volume serial scraped from any JPG;
+    if no JPG exists, body_serial is "UNKNOWN".
+    """
+    photos_by_key: dict[tuple[Path, Path, str], list[Path]] = {}
+    videos_by_key: dict[tuple[Path, str, str], list[Path]] = {}
+    flightlogs: list[tuple[Path, Path]] = []
+
+    for vol in volumes:
+        dcim = vol / "DCIM"
+        if dcim.is_dir():
+            try:
+                dcim_subs = list(dcim.iterdir())
+            except (OSError, PermissionError):
+                dcim_subs = []
+            for sub in dcim_subs:
+                m = _DJI_AIR_DCIM_DIR_RE.match(sub.name)
+                if not m:
+                    continue
+                num = m.group(1)
+                try:
+                    files = list(sub.iterdir())
+                except (OSError, PermissionError):
+                    continue
+                for f in files:
+                    if not f.is_file():
+                        continue
+                    fm = _DJI_AIR_FILE_RE.match(f.name)
+                    if not fm:
+                        continue
+                    base, ext = fm.group(1), fm.group(2).upper()
+                    if ext == "JPG":
+                        photos_by_key.setdefault((vol, sub, base), []).append(f)
+                    elif ext == "MP4":
+                        videos_by_key.setdefault((vol, num, base), []).append(f)
+                # Sidecars share the DCIM folder number under MISC/THM/<num>/.
+                thm_dir = vol / "MISC" / "THM" / num
+                if thm_dir.is_dir():
+                    try:
+                        for f in thm_dir.iterdir():
+                            if not f.is_file():
+                                continue
+                            sm = _DJI_AIR_SIDECAR_RE.match(f.name)
+                            if not sm:
+                                continue
+                            base = sm.group(1)
+                            videos_by_key.setdefault(
+                                (vol, num, base), []
+                            ).append(f)
+                    except (OSError, PermissionError):
+                        pass
+
+        gis = vol / Path(*_DJI_AIR_GIS_REL)
+        if gis.is_file():
+            flightlogs.append((vol, gis))
+
+    primary_for_photo: dict[tuple[Path, Path, str], Path] = {}
+    for key, files in photos_by_key.items():
+        primary_for_photo[key] = files[0]   # only one JPG per basename today
+
+    primary_for_video: dict[tuple[Path, str, str], Path] = {}
+    for key, files in videos_by_key.items():
+        mp4 = next((f for f in files if f.suffix.upper() == ".MP4"), None)
+        if mp4 is not None:
+            primary_for_video[key] = mp4
+
+    primaries = list(primary_for_photo.values()) + list(primary_for_video.values())
+    meta = exiftool_batch(
+        primaries,
+        tags=["DateTimeOriginal", "CreateDate", "SerialNumber"],
+    )
+
+    # Per-volume serial fallback: the drone body serial is constant, so
+    # any JPG's SerialNumber answers for MP4s and the flight log too.
+    vol_serial: dict[Path, str] = {}
+    for key, primary in primary_for_photo.items():
+        vol = key[0]
+        if vol in vol_serial:
+            continue
+        rec = meta.get(primary, {})
+        ser = rec.get("SerialNumber")
+        if ser:
+            vol_serial[vol] = str(ser)
+
+    groups: list[MediaGroup] = []
+
+    for key, files in photos_by_key.items():
+        vol = key[0]
+        primary = primary_for_photo[key]
+        rec = meta.get(primary, {})
+        ts = _sony_parse_dt(rec.get("DateTimeOriginal"))
+        if ts is None:
+            continue
+        try:
+            size = sum(f.stat().st_size for f in files)
+        except OSError:
+            continue
+        body_serial = str(
+            rec.get("SerialNumber") or vol_serial.get(vol) or "UNKNOWN"
+        )
+        groups.append(MediaGroup(
+            kind="photo",
+            primary=primary,
+            files=sorted(files),
+            timestamp=ts,
+            body_serial=body_serial,
+            size_bytes=size,
+            volume=vol,
+        ))
+
+    for key, files in videos_by_key.items():
+        if key not in primary_for_video:
+            continue
+        vol = key[0]
+        primary = primary_for_video[key]
+        rec = meta.get(primary, {})
+        # MP4 only carries QuickTime CreateDate (in UTC for Mavic Air 2).
+        # Users near a UTC day boundary may see clips bucketed off-by-one;
+        # documented as a known quirk.
+        ts = _sony_parse_dt(rec.get("CreateDate") or rec.get("DateTimeOriginal"))
+        if ts is None:
+            continue
+        try:
+            size = sum(f.stat().st_size for f in files)
+        except OSError:
+            continue
+        body_serial = str(
+            rec.get("SerialNumber") or vol_serial.get(vol) or "UNKNOWN"
+        )
+        groups.append(MediaGroup(
+            kind="video",
+            primary=primary,
+            files=sorted(files),
+            timestamp=ts,
+            body_serial=body_serial,
+            size_bytes=size,
+            volume=vol,
+        ))
+
+    for vol, p in flightlogs:
+        try:
+            stat = p.stat()
+        except OSError:
+            continue
+        # Date-bucket by file mtime — the .gis log is per-card-session and
+        # not tied to a single capture, so EXIF-style timestamps don't apply.
+        groups.append(MediaGroup(
+            kind="flightlog",
+            primary=p,
+            files=[p],
+            timestamp=datetime.fromtimestamp(stat.st_mtime),
+            body_serial=vol_serial.get(vol, "UNKNOWN"),
+            size_bytes=stat.st_size,
+            volume=vol,
+        ))
+
+    return groups
+
+
+def dji_air_filter_by_args(groups: list[MediaGroup],
+                             args: argparse.Namespace) -> list[MediaGroup]:
+    out = groups
+    if args.from_date:
+        out = [g for g in out if g.timestamp.date() >= args.from_date]
+    if args.to_date:
+        out = [g for g in out if g.timestamp.date() <= args.to_date]
+    if args.days is not None and args.days > 0:
+        cutoff = (datetime.now() - timedelta(days=args.days)).date()
+        out = [g for g in out if g.timestamp.date() >= cutoff]
+    return out
+
+
+def _dji_air_dest_dir_for(dest_root: Path, bucket: date, body_serial: str,
+                            kind: str) -> Path:
+    """Output dir for drone media.
+
+    Photos/videos: <dest>/RAW/<date>/DJI-DRONES/<serial>/{PHOTOS,VIDEOS}/
+    Flight log:    <dest>/FLIGHTLOGS/<date>/    (sibling to RAW/, no serial
+                                                 — the .gis is per-card, not
+                                                 per-capture)
+    """
+    if kind == "flightlog":
+        return dest_root / FLIGHTLOGS_DIR_NAME / bucket.isoformat()
+    category = "PHOTOS" if kind == "photo" else "VIDEOS"
+    return (dest_root / RAW_ROOT / bucket.isoformat()
+            / DJI_AIR_DEVICE_CLASS / body_serial / category)
+
+
+def dji_air_build_plan(groups: list[MediaGroup],
+                         args: argparse.Namespace) -> Plan:
+    """Build a Plan from drone groups. Stage → finalize pattern. Idempotent.
+
+    Same overwrite policy as Sony: same-size dst → skip, different-size dst
+    → flag overwrite_existing for surfacing in preview.
+    """
+    plan = Plan(dest=args.dest)
+    staging = args.dest / STAGING_DIR_NAME
+
+    for g in groups:
+        target_dir = _dji_air_dest_dir_for(args.dest, g.timestamp.date(),
+                                             g.body_serial, g.kind)
+        for src in g.files:
+            try:
+                src_size = src.stat().st_size
+            except OSError:
+                continue
+            final = target_dir / src.name
+            classification = classify_dst(final, src_size)
+            if classification is None:
+                continue
+            overwrite, existing_size = classification
+            staged = staging / src.name
+            plan.copies.append(CopyOp(src=src, dst=staged, size_bytes=src_size))
+            plan.singleton_moves.append(CopyOp(
+                src=staged, dst=final, size_bytes=src_size,
+                overwrite_existing=overwrite,
+                existing_size_bytes=existing_size,
+            ))
+
+    plan.args_summary = {
+        "dest": str(args.dest),
+        "from": args.from_date.isoformat() if args.from_date else None,
+        "to": args.to_date.isoformat() if args.to_date else None,
+        "device": "dji-air-2",
+    }
+    return plan
+
+
+def dji_air_completion_dates(volumes: list[Path]) -> list[date]:
+    """All distinct shoot dates across drone volumes.
+
+    Lighter-weight than Sony's signature-cached completion (drone cards are
+    typically <100 captures); we just run discover and dedupe. If perf
+    becomes an issue, add a `_sony_volume_signature`-style cache.
+    """
+    dates: set[date] = set()
+    if volumes:
+        groups = dji_air_discover(volumes)
+        dates.update(g.timestamp.date() for g in groups)
+    return sorted(dates)
+
+
+DJI_AIR_2 = Device(
+    name="dji-air-2",
+    device_class=DJI_AIR_DEVICE_CLASS,
+    supports_transcribe=False,   # drone audio is wind/motor — never useful
+    detect=_dji_air_volume_detect,
+    discover=dji_air_discover,
+    filter_by_args=dji_air_filter_by_args,
+    build_plan=dji_air_build_plan,
+    completion_dates=dji_air_completion_dates,
+)
+
+
+# Ordered registry consulted by select_device. New devices append here.
+# Order is the auto-detect priority — earlier devices win ties (none today).
+ALL_DEVICES: list[Device] = [DJI_MIC, SONY_A7C, DJI_AIR_2]
 
 
 def _check_sony_verification() -> None:
@@ -1716,18 +2151,25 @@ def cmd_verify_sony() -> int:
 
 
 def select_device(volumes: list[Path], requested: str) -> Device:
-    """Pick a Device by --device flag value or auto-detect across volumes."""
-    if requested == "dji":
-        return DJI_MIC
-    if requested == "sony":
-        return SONY_A7C
+    """Pick a Device by --device flag value or auto-detect across volumes.
+
+    `requested` is canonical (model-specific). Aliases are handled at parse
+    time by `_parse_device`.
+    """
+    if requested != "auto":
+        for d in ALL_DEVICES:
+            if requested == d.name:
+                return d
+        valid = ", ".join(d.name for d in ALL_DEVICES)
+        sys.exit(f"media-import: unknown device {requested!r}; "
+                 f"valid: auto, {valid}")
     for vol in volumes:
-        if DJI_MIC.detect(vol):
-            return DJI_MIC
-        if SONY_A7C.detect(vol):
-            return SONY_A7C
-    sys.exit("media-import: no recognized media device on any mounted volume. "
-             "Pass --device dji|sony explicitly.")
+        for d in ALL_DEVICES:
+            if d.detect(vol):
+                return d
+    valid = ", ".join(d.name for d in ALL_DEVICES)
+    sys.exit(f"media-import: no recognized media device on any mounted volume. "
+             f"Pass --device <{valid}> explicitly.")
 
 
 # ───────────────────────── completion dispatch ─────────────────────────
@@ -1795,7 +2237,10 @@ def cmd_complete(kind: str, args: argparse.Namespace) -> int:
                                    requested=getattr(args, "ctx_device", "auto") or "auto")
         except SystemExit:
             return 0
-        if device is SONY_A7C:
+        # DJI Mic completion needs Clip-shaped data (clip count, audio min,
+        # tx labels) which doesn't apply to per-capture group devices.
+        # Group-shaped devices (Sony, drone, future) just emit ISO dates.
+        if device is not DJI_MIC:
             relevant = [v for v in all_volumes if device.detect(v)]
             for d in device.completion_dates(relevant):
                 print(d.isoformat())
@@ -1876,14 +2321,35 @@ def parse_iso_date(s: str) -> date:
     return datetime.strptime(s, "%Y-%m-%d").date()
 
 
+_DEVICE_ALIASES = {
+    "dji": "dji-mic-2",      # ambiguous now that DJI Air 2 exists; warn + map
+    "sony": "sony-a7c",      # symmetry; explicit beats abbreviated
+}
+
+
+def _parse_device(s: str) -> str:
+    """Argparse type for --device. Maps deprecated aliases to canonical names.
+
+    Validation against the actual device registry happens in select_device,
+    so a new Device only requires adding it to ALL_DEVICES.
+    """
+    canonical = _DEVICE_ALIASES.get(s, s)
+    if s in _DEVICE_ALIASES:
+        sys.stderr.write(
+            f"warning: --device {s} is deprecated; use --device {canonical}\n"
+        )
+    return canonical
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="media-import",
-        description="Import audio from DJI Mic 2 transmitters.",
+        description="Import media from DJI Mic 2, Sony A7C, and DJI Mavic Air 2.",
     )
-    p.add_argument("--device", choices=("auto", "dji", "sony"),
-                   default="auto",
-                   help="which device profile to use; 'auto' detects from card content")
+    p.add_argument("--device", type=_parse_device, default="auto",
+                   help="which device profile to use; 'auto' detects from card content. "
+                        "Valid: auto, dji-mic-2, sony-a7c, dji-air-2 "
+                        "(legacy aliases dji, sony still accepted with a warning)")
     p.add_argument("--dest", type=Path,
                    help="Destination directory (required for actual runs)")
     p.add_argument("--from", dest="from_date", type=parse_iso_date,
@@ -1997,6 +2463,12 @@ def main(argv: list[str] | None = None) -> int:
     all_volumes = find_all_volumes()
     device = select_device(all_volumes, requested=args.device)
 
+    if args.transcribe and not device.supports_transcribe:
+        sys.exit(
+            f"media-import: --transcribe is not supported for device {device.name}.\n"
+            f"  (drone footage etc. — pass without --transcribe.)"
+        )
+
     if device is SONY_A7C:
         require_exiftool()
         _check_sony_verification()
@@ -2049,7 +2521,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Preview
     clear_status()
-    print(format_preview(plan, chains, relevant, args, est))
+    print(format_preview(plan, chains, relevant, args, est, device))
     print()
 
     if args.dry_run:
@@ -2093,8 +2565,10 @@ def main(argv: list[str] | None = None) -> int:
     print()
     print(f"Done in {fmt_duration(elapsed)} (estimated {fmt_duration(est['total'])}).")
     print(f"  Joined files: {len(plan.joins)}")
+    overwritten = move_stats.get("overwritten", 0)
+    overwrite_str = f", overwrote {overwritten}" if overwritten else ""
     print(f"  Singletons:   {move_stats.get('count', 0)} "
-          f"(skipped {move_stats.get('skipped', 0)})")
+          f"(skipped {move_stats.get('skipped', 0)}{overwrite_str})")
     if plan.transcribes:
         x_realtime = (trans_stats["audio_s"] / max(0.1, trans_stats["elapsed"] - 10.0)
                       if trans_stats["elapsed"] > 10 else 0.0)

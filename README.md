@@ -1,9 +1,10 @@
 # media-import
 
-CLI for importing audio off DJI Mic 2 transmitters. Filters by date range,
-joins 30-minute auto-split chains into single files (with per-pair byte-exact
-overlap trimming), optionally transcribes via local Whisper. Shows a preview
-and time estimate before doing anything.
+CLI for importing media off DJI Mic 2 transmitters, Sony A7C cards, and DJI
+Mavic Air 2 drones. Filters by date range, joins 30-minute auto-split mic
+chains into single files (with per-pair byte-exact overlap trimming),
+optionally transcribes via local Whisper. Shows a preview and time estimate
+before doing anything, and flags any files that would be overwritten.
 
 ## Quickstart
 
@@ -29,7 +30,7 @@ See `~/projects/plans/2026-05-04-media-import-design.md` for the full design.
 To import from a Sony A7C card:
 
 ```sh
-media-import --device sony --dest ~/Photos/2026-05
+media-import --device sony-a7c --dest ~/Photos/2026-05
 ```
 
 Or rely on auto-detection (works when only one card is mounted):
@@ -67,26 +68,68 @@ tradeoff).
 **Date filtering:** `--from`, `--to`, `--days` filter by EXIF `DateTimeOriginal` (stills)
 or `CreateDate` (video).
 
-**Transcription:** `media-import --device sony --transcribe --dest <path>` transcribes video clips.
+**Transcription:** `media-import --device sony-a7c --transcribe --dest <path>` transcribes video clips.
 For each video, ffmpeg extracts the audio track to a 16kHz mono PCM WAV, then whisper
 transcribes it. Both the extracted WAV and the `.srt` transcript land in `TRANSCRIPTS/`.
 Photos are not transcribed — `--transcribe` only affects video groups. The intermediate
 WAV stays on disk in `TRANSCRIPTS/<clipname>.wav` alongside the `.srt`; it is useful
 for re-runs and audits.
 
+## DJI Mavic Air 2
+
+To import from a DJI Mavic Air 2 SD card:
+
+```sh
+media-import --device dji-air-2 --dest ~/Drone/2026-05
+```
+
+Or rely on auto-detection.
+
+**Output layout:**
+
+```
+<dest>/RAW/<YYYY-MM-DD>/DJI-DRONES/<body-serial>/{PHOTOS,VIDEOS}/
+<dest>/FLIGHTLOGS/<YYYY-MM-DD>/dji.gis
+```
+
+The body serial comes from EXIF `SerialNumber` on JPGs (constant per drone).
+MP4-only cards inherit the serial from any JPG on the same volume; if there
+are no JPGs at all, body serial falls back to `UNKNOWN`.
+
+**Sidecars:** `.THM` (160×90) and `.SCR` (960×540) JPEG previews from
+`MISC/THM/<NNN>/` are copied alongside each video.
+
+**Flight log:** `MISC/GIS/dji.gis` is per-card-session (not per-clip), so it
+sits in a sibling `FLIGHTLOGS/` tree, not under `RAW/`. Date-bucketed by file
+mtime.
+
+**No `--transcribe`:** drone audio is wind and motor — never useful speech.
+The flag is rejected for `--device dji-air-2` at dispatch time.
+
+**Known quirk:** MP4 timestamps come from QuickTime `CreateDate` (UTC). Clips
+shot near a UTC day boundary may bucket into the "wrong" local date.
+
+## Overwrite handling
+
+For all devices, the preview lists any files that would replace existing
+content (same path, different size). Same-size existing files are skipped
+silently — re-running with the same args is safe and idempotent. A surprise
+size mismatch with no overwrite intent (shouldn't happen if `build_plan` is
+correct) raises before any moves so partial state can't accumulate.
+
 ## Flags
 
 | Flag                  | Default      | Notes |
 |-----------------------|--------------|-------|
 | `--dest <path>`       | (required)   | Where files land. See [Output layout](#output-layout). |
-| `--device auto\|dji\|sony` | `auto`  | Choose device. `auto` picks DJI or Sony based on what's mounted. |
-| `--from YYYY-MM-DD`   | earliest     | Filter by recording timestamp from filename (DJI) or EXIF (Sony). |
+| `--device <name>`     | `auto`       | One of `auto`, `dji-mic-2`, `sony-a7c`, `dji-air-2`. Legacy aliases `dji` and `sony` still work but warn. |
+| `--from YYYY-MM-DD`   | earliest     | Filter by recording timestamp from filename (DJI mic) or EXIF (Sony, drone). |
 | `--to YYYY-MM-DD`     | today        | Inclusive. |
 | `--days N`            |              | Shorthand for `--from <N days ago>`; mutually exclusive with `--from`/`--to`. |
-| `--version edit\|orig\|both` | `both` | Which version(s) of each clip to import. (DJI only) |
-| `--mic TX01\|TX02\|all` | `all`      | Filter by transmitter. (DJI only) |
-| `--join` / `--no-join` | `--join`    | Join 30-min auto-split chains. (DJI only) |
-| `--transcribe`        | off          | Transcribe joined/singleton files (DJI), or video clips (Sony). For DJI, skips individual chain members. |
+| `--version edit\|orig\|both` | `both` | Which version(s) of each clip to import. (DJI mic only) |
+| `--mic TX01\|TX02\|all` | `all`      | Filter by transmitter. (DJI mic only) |
+| `--join` / `--no-join` | `--join`    | Join 30-min auto-split chains. (DJI mic only) |
+| `--transcribe`        | off          | Transcribe joined/singleton files (DJI mic) or video clips (Sony). Rejected for `dji-air-2`. |
 | `--model <name>`      | `tiny`       | Whisper model. Use tab completion to see what's cached. |
 | `--verify-sony`       | off          | One-time verification of Sony import code; required before first real import. |
 | `--yes`               | off          | Skip confirmation prompt. |
@@ -109,10 +152,13 @@ Once installed, tab completion provides:
 ```
 
 - `RAW/` — top-level marker for raw offload. Always present.
-- `<YYYY-MM-DD>` — recording date from the filename (DJI) or EXIF (Sony). Always present.
-- `<DEVICE-CLASS>` — `DJI-MICS` or `SONY-A7C`.
-- `<DEVICE>` — `TX01` / `TX02` (DJI), or body serial (Sony).
-- `<CATEGORY>` — `EDIT`, `ORIG`, `TRANSCRIPTS` (DJI), or `PHOTOS`, `VIDEOS` (Sony).
+- `<YYYY-MM-DD>` — recording date from the filename (DJI mic) or EXIF (Sony, drone). Always present.
+- `<DEVICE-CLASS>` — `DJI-MICS`, `SONY-A7C`, or `DJI-DRONES`.
+- `<DEVICE>` — `TX01` / `TX02` (mic), or body serial (Sony, drone).
+- `<CATEGORY>` — `EDIT`, `ORIG`, `TRANSCRIPTS` (mic), or `PHOTOS`, `VIDEOS` (Sony, drone).
+
+`FLIGHTLOGS/<YYYY-MM-DD>/` is a sibling to `RAW/` for per-card-session
+artifacts (currently just DJI's `dji.gis` flight telemetry).
 
 Example (DJI): `~/Audio/podcast/RAW/2026-05-03/DJI-MICS/TX01/EDIT/TX01_20260503_112250_140603_edit_joined.wav`
 
@@ -138,8 +184,7 @@ DJI behavior varies by transmitter:
 - **TX01** writes ≥2 seconds of byte-identical overlap at every boundary.
 
 The script does per-pair byte-exact overlap detection at runtime (binary
-search on `prev.tail == cur.head`) and trims accordingly before concat. See
-`verify_overlap_v3.py` for the empirical evidence.
+search on `prev.tail == cur.head`) and trims accordingly before concat.
 
 ## Install
 

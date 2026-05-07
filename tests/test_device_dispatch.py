@@ -24,9 +24,22 @@ class DeviceDispatchTest(unittest.TestCase):
             picked = m.select_device([vol], requested="auto")
             self.assertIs(picked, m.DJI_MIC)
 
-    def test_select_device_explicit_dji(self):
-        picked = m.select_device([], requested="dji")
+    def test_select_device_explicit_dji_mic_2(self):
+        picked = m.select_device([], requested="dji-mic-2")
         self.assertIs(picked, m.DJI_MIC)
+
+    def test_parse_device_maps_dji_alias(self):
+        # Deprecated alias is mapped at parse time (warns to stderr).
+        canonical = m._parse_device("dji")
+        self.assertEqual(canonical, "dji-mic-2")
+
+    def test_parse_device_maps_sony_alias(self):
+        canonical = m._parse_device("sony")
+        self.assertEqual(canonical, "sony-a7c")
+
+    def test_select_device_unknown_name_exits(self):
+        with self.assertRaises(SystemExit):
+            m.select_device([], requested="not-a-real-device")
 
     def test_select_device_auto_returns_sony_for_sony_card(self):
         import tempfile
@@ -46,9 +59,21 @@ class DeviceDispatchTest(unittest.TestCase):
             picked = m.select_device([vol], requested="auto")
             self.assertIs(picked, m.SONY_A7C)
 
-    def test_select_device_explicit_sony(self):
-        picked = m.select_device([], requested="sony")
+    def test_select_device_explicit_sony_a7c(self):
+        picked = m.select_device([], requested="sony-a7c")
         self.assertIs(picked, m.SONY_A7C)
+
+    def test_select_device_explicit_dji_air_2(self):
+        picked = m.select_device([], requested="dji-air-2")
+        self.assertIs(picked, m.DJI_AIR_2)
+
+    def test_dji_air_device_exposes_expected_hooks(self):
+        d = m.DJI_AIR_2
+        self.assertEqual(d.name, "dji-air-2")
+        self.assertEqual(d.device_class, "DJI-DRONES")
+        self.assertFalse(d.supports_transcribe)
+        self.assertTrue(callable(d.detect))
+        self.assertTrue(callable(d.discover))
 
     def test_sony_detect_rejects_random_dir(self):
         import tempfile
