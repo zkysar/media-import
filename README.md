@@ -134,6 +134,7 @@ correct) raises before any moves so partial state can't accumulate.
 | `--verify-sony`       | off          | One-time verification of Sony import code; required before first real import. |
 | `--yes`               | off          | Skip confirmation prompt. |
 | `--dry-run`           | off          | Preview only. |
+| `--eject`             | off          | After a successful import, try to eject each source volume via `diskutil eject` (best-effort; failures are reported but not fatal). |
 
 ## Tab completion
 

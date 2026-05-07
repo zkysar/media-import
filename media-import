@@ -384,6 +384,25 @@ def find_all_volumes() -> list[Path]:
     return [v for v in VOLUMES_GLOB.iterdir() if v.is_dir()]
 
 
+def try_eject_volumes(volumes: Iterable[Path]) -> None:
+    """Best-effort eject via `diskutil eject`. Never raises; reports per-volume."""
+    for v in volumes:
+        try:
+            res = subprocess.run(
+                ["diskutil", "eject", str(v)],
+                capture_output=True, text=True, timeout=30,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            print(f"  eject {v.name}: failed ({e})")
+            continue
+        if res.returncode == 0:
+            print(f"  eject {v.name}: ok")
+        else:
+            msg = (res.stderr or res.stdout or "").strip().splitlines()
+            tail = msg[-1] if msg else f"exit {res.returncode}"
+            print(f"  eject {v.name}: failed ({tail})")
+
+
 def discover_clips(volumes: Iterable[Path]) -> list[Clip]:
     """rglob each volume; parse filenames + WAV headers."""
     clips: list[Clip] = []
@@ -2372,6 +2391,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Skip confirmation prompt")
     p.add_argument("--dry-run", action="store_true",
                    help="Show preview only; never execute")
+    p.add_argument("--eject", action="store_true",
+                   help="Try to eject source volumes after a successful import (best-effort)")
     p.add_argument("--__complete", dest="complete_kind",
                    help=argparse.SUPPRESS)
     p.add_argument("--__ctx-from", dest="ctx_from", help=argparse.SUPPRESS)
@@ -2580,6 +2601,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  Transcribe failures: {len(trans_stats['failures'])}")
         for path, err in trans_stats["failures"][:3]:
             print(f"    {path.name}: {err[:120]}")
+
+    if args.eject:
+        print()
+        print("Ejecting source volumes:")
+        try_eject_volumes(relevant)
 
     return 0
 
