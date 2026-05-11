@@ -7,25 +7,25 @@ CLI for importing media off DJI Mic 2 transmitters, Sony A7C cards, and DJI Mavi
 Files land at:
 
 ```
-<dest>/RAW/<date>/<DEVICE-CLASS>/<DEVICE>/<CATEGORY>/
+<dest>/RAW/<date>/<DEVICE-CLASS>/[<TX>/]<CATEGORY>/
 <dest>/FLIGHTLOGS/<date>/                       # sibling to RAW/, per-card-session artifacts
 ```
 
 - **RAW** — fixed top-level marker for raw, untouched offload. Reserves room for siblings like `EDIT/`, `EXPORT/`, or `FLIGHTLOGS/` (already used).
 - **date** — `YYYY-MM-DD`, the recording date parsed from the filename (DJI mic) or EXIF (Sony, drone). Always present, even for single-date imports (consistent paths trump shorter ones).
 - **DEVICE-CLASS** — `DJI-MICS` (mics), `SONY-A7C` (camera), or `DJI-DRONES` (Mavic Air 2). Always plural.
-- **DEVICE** — `TX01`, `TX02` for mics; body serial for Sony and drone. The specific physical device within the class.
+- **TX** — `TX01` / `TX02`, **DJI mic only**. The two transmitters genuinely need separate folders. Sony and drone have no per-body level: body-serial-per-folder was tried originally, but MP4 atoms carry no serial, the `UNKNOWN/` fallback folder was worse than no level, and one body per setup is the assumption. `MediaGroup.body_serial` is still populated for verify/diagnostic display, just not used in paths.
 - **CATEGORY** — `EDIT`, `ORIG`, `TRANSCRIPTS` (DJI mic), or `PHOTOS`, `VIDEOS` (Sony, drone). Output kind for that device.
 
 Folders are upper-case where possible; filenames are left as the camera/transmitter wrote them.
 
 Example (DJI mic): `~/Audio/podcast/RAW/2026-05-03/DJI-MICS/TX01/EDIT/TX01_20260503_112250_140603_edit_joined.wav`
 
-Example (Sony): `~/Photos/2026-05/RAW/2026-05-03/SONY-A7C/0123456789/PHOTOS/DSC01234.ARW`
+Example (Sony): `~/Photos/2026-05/RAW/2026-05-03/SONY-A7C/PHOTOS/DSC01234.ARW`
 
-Example (drone): `~/Drone/2026-05/RAW/2026-05-07/DJI-DRONES/EXAMPLE0000001/VIDEOS/DJI_0014.MP4` (with `.THM` and `.SCR` sidecars next to it). Flight log lands at `~/Drone/2026-05/FLIGHTLOGS/2026-05-07/dji.gis`.
+Example (drone): `~/Drone/2026-05/RAW/2026-05-07/DJI-DRONES/VIDEOS/DJI_0014.MP4` (with `.THM` and `.SCR` sidecars next to it). Flight log lands at `~/Drone/2026-05/FLIGHTLOGS/2026-05-07/dji.gis`.
 
-`FLIGHTLOGS/` is a sibling to `RAW/` because per-card-session artifacts can't be tied to a single capture's date/device. Forcing them under `RAW/<date>/<DEVICE-CLASS>/<DEVICE>/` would invent a false mapping; siblinghood keeps the model honest.
+`FLIGHTLOGS/` is a sibling to `RAW/` because per-card-session artifacts can't be tied to a single capture's date/device. Forcing them under `RAW/<date>/<DEVICE-CLASS>/` would invent a false mapping; siblinghood keeps the model honest.
 
 ## Devices
 

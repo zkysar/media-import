@@ -268,10 +268,17 @@ def exiftool_batch(paths: list[Path], tags: list[str]) -> dict[Path, dict]:
     Empty `paths` → empty dict (no subprocess invocation).
     Nonzero exit or unparsable output → empty dict (caller decides fallback).
     Per-file missing tags are simply absent from that path's record.
+
+    `QuickTimeUTC=1` converts MP4/MOV CreateDate (stored as UTC per the
+    QuickTime spec) into local time on read. Without it, Sony A7C and DJI
+    Air videos would be off by the local UTC offset (date-bucketed wrong
+    for clips shot late in the day). EXIF DateTimeOriginal on stills is
+    unaffected — that's already camera-local.
     """
     if not paths:
         return {}
-    cmd = ["exiftool", "-j", "-d", "%Y:%m:%d %H:%M:%S"]
+    cmd = ["exiftool", "-j", "-d", "%Y:%m:%d %H:%M:%S",
+           "-api", "QuickTimeUTC=1"]
     for t in tags:
         cmd.append(f"-{t}")
     cmd.extend(str(p) for p in paths)
@@ -574,16 +581,22 @@ def classify_dst(final: Path, expected_size: int) -> tuple[bool, int] | None:
     return (False, 0)
 
 
-def sony_dest_dir_for(dest_root: Path, bucket: date, body_serial: str,
-                      kind: str) -> Path:
-    """Output dir: <dest>/RAW/<date>/SONY-A7C/<body_serial>/<PHOTOS|VIDEOS>/.
+def sony_dest_dir_for(dest_root: Path, bucket: date, kind: str) -> Path:
+    """Output dir: <dest>/RAW/<date>/SONY-A7C/<PHOTOS|VIDEOS>/.
 
     `kind` is "photo" or "video"; mapped to the upper-case PHOTOS/VIDEOS
     category label used in the path.
+
+    The DJI mic device sits at the same depth with a `TX01`/`TX02` segment
+    between class and category, because two transmitters genuinely need
+    separate folders. Sony has no equivalent disambiguator — body serial
+    was tried, but it's best-effort (MP4s carry none) and the UNKNOWN
+    fallback folder was worse than just not having the level. One A7C
+    body per setup is assumed; multi-body shooters would need a rework.
     """
     category = SONY_PHOTOS_CATEGORY if kind == "photo" else SONY_VIDEOS_CATEGORY
     return (dest_root / RAW_ROOT / bucket.isoformat()
-            / SONY_DEVICE_CLASS / body_serial / category)
+            / SONY_DEVICE_CLASS / category)
 
 
 def build_plan(chains: list[Chain], args: argparse.Namespace) -> Plan:
@@ -1516,20 +1529,39 @@ def _sony_parse_dt(s: str | None) -> datetime | None:
         return None
 
 
+def _sony_serial_from_rec(rec: dict) -> str | None:
+    """Body serial out of an exiftool record. Tag varies by file type:
+    Sony JPEGs expose SerialNumber, ARW raws expose InternalSerialNumber,
+    MP4s usually expose nothing. Returns None if no tag found.
+    """
+    for tag in ("SerialNumber", "InternalSerialNumber", "BodySerialNumber"):
+        v = rec.get(tag)
+        if v:
+            return str(v)
+    return None
+
+
 def sony_discover(volumes: list[Path]) -> list[MediaGroup]:
     """Scan Sony A7C SD-card volumes; return SonyGroups (one per logical capture).
 
     Photo groups: same-basename .JPG / .ARW within a DCIM/<NNN>MSDCF/ folder
     coalesce into one group. The .JPG (when present) is treated as primary.
 
-    Video groups: .MP4 + matching .XML + .THM (basename match after stripping
-    M01/R01 suffix) coalesce. The .MP4 is primary.
+    Video groups: .MP4 + matching .XML (basename match after stripping
+    M01/R01 suffix) coalesce. The .MP4 is primary. Thumbnails under
+    PRIVATE/M4ROOT/THMBNL/ (e.g. CnnnnT01.JPG on A7C firmware) are
+    intentionally skipped — not imported.
 
     DB / firmware artifacts (MEDIAPRO.XML, STATUS.BIN, AVF_INFO/, PRIVATE/SONY/,
     .dat files, INDEX.BDM) are skipped — not in any group, never read.
 
     Groups whose primary's EXIF can't be parsed (no DateTimeOriginal /
     CreateDate) are dropped — caller can't filter or place them.
+
+    Body serial falls back across SerialNumber → InternalSerialNumber →
+    BodySerialNumber → any still's serial on the same volume → "UNKNOWN".
+    MP4s lack serial tags on A7C, so the per-volume fallback is how videos
+    get a non-UNKNOWN serial.
     """
     stills_by_base: dict[tuple[Path, Path, str], list[Path]] = {}
     videos_by_basename: dict[tuple[Path, str], list[Path]] = {}
@@ -1553,21 +1585,20 @@ def sony_discover(volumes: list[Path]) -> list[MediaGroup]:
                     stills_by_base.setdefault(key, []).append(f)
 
         for vid_root in SONY_VIDEO_ROOTS:
-            for sub_name in ("CLIP", "THMBNL"):
-                d = vol / vid_root / sub_name
-                if not d.is_dir():
+            d = vol / vid_root / "CLIP"
+            if not d.is_dir():
+                continue
+            try:
+                iter_files = list(d.iterdir())
+            except (OSError, PermissionError):
+                continue
+            for f in iter_files:
+                if not f.is_file():
                     continue
-                try:
-                    iter_files = list(d.iterdir())
-                except (OSError, PermissionError):
+                if _sony_is_db_path(f, vol):
                     continue
-                for f in iter_files:
-                    if not f.is_file():
-                        continue
-                    if _sony_is_db_path(f, vol):
-                        continue
-                    base = _sony_video_basename(f.stem)
-                    videos_by_basename.setdefault((vol, base), []).append(f)
+                base = _sony_video_basename(f.stem)
+                videos_by_basename.setdefault((vol, base), []).append(f)
 
     primary_for_still: dict[tuple[Path, Path, str], Path] = {}
     for key, files in stills_by_base.items():
@@ -1583,8 +1614,20 @@ def sony_discover(volumes: list[Path]) -> list[MediaGroup]:
     primaries = list(primary_for_still.values()) + list(primary_for_video.values())
     meta = exiftool_batch(
         primaries,
-        tags=["DateTimeOriginal", "CreateDate", "SerialNumber"],
+        tags=["DateTimeOriginal", "CreateDate",
+              "SerialNumber", "InternalSerialNumber", "BodySerialNumber"],
     )
+
+    # Per-volume serial fallback: MP4s on A7C carry no serial tag, so any
+    # still's serial on the same card answers for the videos too.
+    vol_serial: dict[Path, str] = {}
+    for key, primary in primary_for_still.items():
+        vol = key[0]
+        if vol in vol_serial:
+            continue
+        ser = _sony_serial_from_rec(meta.get(primary, {}))
+        if ser:
+            vol_serial[vol] = ser
 
     groups: list[MediaGroup] = []
 
@@ -1604,7 +1647,9 @@ def sony_discover(volumes: list[Path]) -> list[MediaGroup]:
             primary=primary,
             files=sorted(files),
             timestamp=ts,
-            body_serial=str(rec.get("SerialNumber") or "UNKNOWN"),
+            body_serial=(_sony_serial_from_rec(rec)
+                        or vol_serial.get(vol)
+                        or "UNKNOWN"),
             size_bytes=size,
             volume=vol,
         ))
@@ -1627,7 +1672,9 @@ def sony_discover(volumes: list[Path]) -> list[MediaGroup]:
             primary=primary,
             files=sorted(files),
             timestamp=ts,
-            body_serial=str(rec.get("SerialNumber") or "UNKNOWN"),
+            body_serial=(_sony_serial_from_rec(rec)
+                        or vol_serial.get(vol)
+                        or "UNKNOWN"),
             size_bytes=size,
             volume=vol,
         ))
@@ -1655,8 +1702,7 @@ def sony_build_plan(groups: list[MediaGroup],
     staging = args.dest / STAGING_DIR_NAME
 
     for g in groups:
-        target_dir = sony_dest_dir_for(args.dest, g.timestamp.date(),
-                                         g.body_serial, g.kind)
+        target_dir = sony_dest_dir_for(args.dest, g.timestamp.date(), g.kind)
         for src in g.files:
             try:
                 src_size = src.stat().st_size
@@ -1678,7 +1724,7 @@ def sony_build_plan(groups: list[MediaGroup],
         if g.kind == "video" and args.transcribe:
             transcripts_dir = (args.dest / RAW_ROOT
                                 / g.timestamp.date().isoformat()
-                                / SONY_DEVICE_CLASS / g.body_serial
+                                / SONY_DEVICE_CLASS
                                 / TRANSCRIPTS_CATEGORY)
             final_video = target_dir / g.primary.name
             audio_wav = transcripts_dir / (g.primary.stem + ".wav")
@@ -2004,20 +2050,24 @@ def dji_air_filter_by_args(groups: list[MediaGroup],
     return out
 
 
-def _dji_air_dest_dir_for(dest_root: Path, bucket: date, body_serial: str,
-                            kind: str) -> Path:
+def _dji_air_dest_dir_for(dest_root: Path, bucket: date, kind: str) -> Path:
     """Output dir for drone media.
 
-    Photos/videos: <dest>/RAW/<date>/DJI-DRONES/<serial>/{PHOTOS,VIDEOS}/
-    Flight log:    <dest>/FLIGHTLOGS/<date>/    (sibling to RAW/, no serial
-                                                 — the .gis is per-card, not
-                                                 per-capture)
+    Photos/videos: <dest>/RAW/<date>/DJI-DRONES/{PHOTOS,VIDEOS}/
+    Flight log:    <dest>/FLIGHTLOGS/<date>/    (sibling to RAW/, per-card-
+                                                 session artifact, not per
+                                                 capture)
+
+    Body-serial level was removed for the same reason as Sony: MP4s carry
+    no serial tag, the fallback created `UNKNOWN/` folders, and one drone
+    per setup is assumed. The MediaGroup.body_serial field is still
+    populated for verify/diagnostic display; it just isn't in the path.
     """
     if kind == "flightlog":
         return dest_root / FLIGHTLOGS_DIR_NAME / bucket.isoformat()
     category = "PHOTOS" if kind == "photo" else "VIDEOS"
     return (dest_root / RAW_ROOT / bucket.isoformat()
-            / DJI_AIR_DEVICE_CLASS / body_serial / category)
+            / DJI_AIR_DEVICE_CLASS / category)
 
 
 def dji_air_build_plan(groups: list[MediaGroup],
@@ -2032,7 +2082,7 @@ def dji_air_build_plan(groups: list[MediaGroup],
 
     for g in groups:
         target_dir = _dji_air_dest_dir_for(args.dest, g.timestamp.date(),
-                                             g.body_serial, g.kind)
+                                             g.kind)
         for src in g.files:
             try:
                 src_size = src.stat().st_size

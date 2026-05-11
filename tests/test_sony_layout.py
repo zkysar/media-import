@@ -10,16 +10,14 @@ m = load()
 
 class SonyLayoutTest(unittest.TestCase):
     def test_photo_dest_dir_shape(self):
-        d = m.sony_dest_dir_for(Path("/dest"), date(2026, 5, 3),
-                                 "4012345", "photo")
+        d = m.sony_dest_dir_for(Path("/dest"), date(2026, 5, 3), "photo")
         self.assertEqual(
-            d, Path("/dest/RAW/2026-05-03/SONY-A7C/4012345/PHOTOS"))
+            d, Path("/dest/RAW/2026-05-03/SONY-A7C/PHOTOS"))
 
     def test_video_dest_dir_shape(self):
-        d = m.sony_dest_dir_for(Path("/dest"), date(2026, 5, 3),
-                                 "4012345", "video")
+        d = m.sony_dest_dir_for(Path("/dest"), date(2026, 5, 3), "video")
         self.assertEqual(
-            d, Path("/dest/RAW/2026-05-03/SONY-A7C/4012345/VIDEOS"))
+            d, Path("/dest/RAW/2026-05-03/SONY-A7C/VIDEOS"))
 
     def test_video_transcribe_extracts_audio_into_transcripts_dir(self):
         args = argparse.Namespace(
@@ -39,14 +37,14 @@ class SonyLayoutTest(unittest.TestCase):
         ax = plan.audio_extracts[0]
         self.assertEqual(
             ax.src,
-            Path("/dest/RAW/2026-05-03/SONY-A7C/4012345/VIDEOS/C0001.MP4"))
+            Path("/dest/RAW/2026-05-03/SONY-A7C/VIDEOS/C0001.MP4"))
         self.assertEqual(
             ax.dst,
-            Path("/dest/RAW/2026-05-03/SONY-A7C/4012345/TRANSCRIPTS/C0001.wav"))
+            Path("/dest/RAW/2026-05-03/SONY-A7C/TRANSCRIPTS/C0001.wav"))
         op = plan.transcribes[0]
         self.assertEqual(
             op.output_dir,
-            Path("/dest/RAW/2026-05-03/SONY-A7C/4012345/TRANSCRIPTS"))
+            Path("/dest/RAW/2026-05-03/SONY-A7C/TRANSCRIPTS"))
         self.assertEqual(op.audio, ax.dst)
 
     def test_video_no_transcribe_when_flag_off(self):

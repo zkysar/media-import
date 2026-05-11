@@ -50,8 +50,7 @@ class DjiAirLayoutTest(unittest.TestCase):
                 self.assertEqual(rel.parts[0], "RAW")
                 self.assertEqual(rel.parts[1], "2026-05-07")
                 self.assertEqual(rel.parts[2], "DJI-DRONES")
-                self.assertEqual(rel.parts[3], "EXAMPLE0000001")
-                self.assertEqual(rel.parts[4], "PHOTOS")
+                self.assertEqual(rel.parts[3], "PHOTOS")
 
     def test_videos_and_sidecars_route_to_raw_videos(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -67,7 +66,7 @@ class DjiAirLayoutTest(unittest.TestCase):
                 rel = d.relative_to(dest)
                 self.assertEqual(rel.parts[0], "RAW")
                 self.assertEqual(rel.parts[2], "DJI-DRONES")
-                self.assertEqual(rel.parts[4], "VIDEOS")
+                self.assertEqual(rel.parts[3], "VIDEOS")
 
     def test_flightlog_routes_to_flightlogs_sibling(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -53,14 +53,16 @@ corrupting an import.)
 **Output layout:**
 
 ```
-<dest>/RAW/<YYYY-MM-DD>/SONY-A7C/<body-serial>/{PHOTOS,VIDEOS}/
+<dest>/RAW/<YYYY-MM-DD>/SONY-A7C/{PHOTOS,VIDEOS}/
 ```
 
-The body serial comes from EXIF `SerialNumber`. If EXIF is unavailable, falls back to
-`UNKNOWN`. Stills and video land in separate folders.
+Stills and video land in separate folders. No body-serial level — A7C MP4 atoms carry
+no serial tag and the best-effort fallback created `UNKNOWN/` folders that were worse
+than no level. One A7C body per setup is assumed.
 
-**Sidecars:** `.ARW` alongside `.JPG`, and `.XML`/`.THM` alongside `.MP4` are copied
-verbatim — no transcoding, no skipping.
+**Sidecars:** `.ARW` alongside `.JPG` is copied verbatim — no transcoding, no skipping.
+For video, `.MP4` plus its `M01.XML` sidecar are copied; the `T01.JPG` thumbnail in
+`PRIVATE/M4ROOT/THMBNL/` is intentionally skipped.
 
 **HEIF support:** `.HIF` files are intentionally unsupported (complexity vs. use-case
 tradeoff).
@@ -88,13 +90,13 @@ Or rely on auto-detection.
 **Output layout:**
 
 ```
-<dest>/RAW/<YYYY-MM-DD>/DJI-DRONES/<body-serial>/{PHOTOS,VIDEOS}/
+<dest>/RAW/<YYYY-MM-DD>/DJI-DRONES/{PHOTOS,VIDEOS}/
 <dest>/FLIGHTLOGS/<YYYY-MM-DD>/dji.gis
 ```
 
-The body serial comes from EXIF `SerialNumber` on JPGs (constant per drone).
-MP4-only cards inherit the serial from any JPG on the same volume; if there
-are no JPGs at all, body serial falls back to `UNKNOWN`.
+No body-serial level — same reasoning as Sony (MP4s carry no serial, the
+fallback `UNKNOWN/` folder was worse than no level). One drone per setup is
+assumed.
 
 **Sidecars:** `.THM` (160×90) and `.SCR` (960×540) JPEG previews from
 `MISC/THM/<NNN>/` are copied alongside each video.
@@ -149,21 +151,27 @@ Once installed, tab completion provides:
 ## Output layout
 
 ```
-<dest>/RAW/<YYYY-MM-DD>/<DEVICE-CLASS>/<DEVICE>/<CATEGORY>/
+<dest>/RAW/<YYYY-MM-DD>/<DEVICE-CLASS>/[<TX>/]<CATEGORY>/
 ```
 
 - `RAW/` — top-level marker for raw offload. Always present.
 - `<YYYY-MM-DD>` — recording date from the filename (DJI mic) or EXIF (Sony, drone). Always present.
 - `<DEVICE-CLASS>` — `DJI-MICS`, `SONY-A7C`, or `DJI-DRONES`.
-- `<DEVICE>` — `TX01` / `TX02` (mic), or body serial (Sony, drone).
+- `<TX>` — `TX01` / `TX02`, **DJI mic only**. The two transmitters genuinely need
+  separate folders, so the level is required there. Sony and drone don't have an
+  equivalent level: body-serial-per-folder was tried, but MP4s carry no serial and
+  the `UNKNOWN/` fallback folder was worse than no level at all. One body per setup
+  is assumed.
 - `<CATEGORY>` — `EDIT`, `ORIG`, `TRANSCRIPTS` (mic), or `PHOTOS`, `VIDEOS` (Sony, drone).
 
 `FLIGHTLOGS/<YYYY-MM-DD>/` is a sibling to `RAW/` for per-card-session
 artifacts (currently just DJI's `dji.gis` flight telemetry).
 
-Example (DJI): `~/Audio/podcast/RAW/2026-05-03/DJI-MICS/TX01/EDIT/TX01_20260503_112250_140603_edit_joined.wav`
+Example (DJI mic): `~/Audio/podcast/RAW/2026-05-03/DJI-MICS/TX01/EDIT/TX01_20260503_112250_140603_edit_joined.wav`
 
-Example (Sony): `~/Photos/2026-05/RAW/2026-05-03/SONY-A7C/0123456789/PHOTOS/DSC01234.ARW`
+Example (Sony): `~/Photos/2026-05/RAW/2026-05-03/SONY-A7C/PHOTOS/DSC01234.ARW`
+
+Example (drone): `~/Drone/2026-05/RAW/2026-05-07/DJI-DRONES/VIDEOS/DJI_0014.MP4`
 
 ## Auto-split detection
 
