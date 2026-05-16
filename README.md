@@ -124,7 +124,7 @@ correct) raises before any moves so partial state can't accumulate.
 | Flag                  | Default      | Notes |
 |-----------------------|--------------|-------|
 | `--dest <path>`       | (required)   | Where files land. See [Output layout](#output-layout). With a trailing slug, treated as the parent root. |
-| `<slug>` (positional) |              | Trailing positional. When given, the proposed dest is `<dest>/<earliest-shoot-date>-<slug>/`, where the date is read from the media's EXIF/filename after discovery. After scanning, you're shown the proposed path pre-filled in an editable prompt — press enter to accept, edit to change, empty to abort. `--yes` skips the prompt. Slug must be lowercase alnum with single dashes (e.g. `media-import --days 1 --dest /Volumes/zachssd poster`). |
+| `<slug>` (positional) |              | Trailing positional. When given, the proposed dest is `<dest>/<earliest-shoot-date>-<slug>/`, where the date is read from the media's EXIF/filename after discovery. After scanning, you're prompted `Dest [<proposed-path>]:` — press enter to accept, type an absolute path to override. `--yes` skips the prompt. Slug must be lowercase alnum with single dashes (e.g. `media-import --days 1 --dest /Volumes/zachssd poster`). |
 | `--device <name>`     | `auto`       | One of `auto`, `dji-mic-2`, `sony-a7c`, `dji-air-2`. Legacy aliases `dji` and `sony` still work but warn. |
 | `--from YYYY-MM-DD`   | earliest     | Filter by recording timestamp from filename (DJI mic) or EXIF (Sony, drone). |
 | `--to YYYY-MM-DD`     | today        | Inclusive. |

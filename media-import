@@ -2438,37 +2438,20 @@ def _earliest_shoot_date(items: list, chains: list) -> date | None:
     return min(candidates) if candidates else None
 
 
-def prompt_editable(prompt: str, default: str) -> str:
-    """Show a prompt with `default` pre-filled in the editable line buffer.
+def prompt_with_default(prompt: str, default: str) -> str:
+    """Bracket-default prompt: shows `[default]`; empty input accepts it.
 
-    User can edit or press enter to accept verbatim. Returns whatever they
-    submit (stripped of trailing newline). On non-TTY, returns `default`
-    unchanged (so piped/cron runs match interactive enter-to-accept).
+    Avoids readline pre-fill (unreliable on macOS libedit — fails silently,
+    leaving the user staring at an empty prompt with no hint a default
+    exists). Non-TTY returns the default unchanged.
     """
     if not sys.stdin.isatty():
         return default
     try:
-        import readline
-    except ImportError:
-        # Fall back to bracketed default; enter-empty accepts.
-        try:
-            raw = input(f"{prompt}[{default}] ").strip()
-        except EOFError:
-            return default
-        return raw or default
-
-    def hook() -> None:
-        readline.insert_text(default)
-        readline.redisplay()
-
-    readline.set_startup_hook(hook)
-    try:
-        try:
-            return input(prompt)
-        except EOFError:
-            return default
-    finally:
-        readline.set_startup_hook(None)
+        raw = input(f"{prompt} [{default}]: ").strip()
+    except EOFError:
+        return default
+    return raw or default
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2604,10 +2587,16 @@ def _confirm_dest(args: argparse.Namespace, items: list, chains: list) -> Path:
         print(f"Dest: {proposed}", file=sys.stderr)
         return proposed
 
-    chosen = prompt_editable("Dest: ", str(proposed)).strip()
+    chosen = prompt_with_default("Dest", str(proposed)).strip()
     if not chosen:
         sys.exit("aborted.")
-    return Path(chosen).expanduser()
+    resolved = Path(chosen).expanduser()
+    if not resolved.is_absolute():
+        sys.exit(
+            f"media-import: dest {chosen!r} is a relative path. "
+            f"Enter an absolute path or press enter to accept the default."
+        )
+    return resolved
 
 
 def main(argv: list[str] | None = None) -> int:
