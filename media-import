@@ -2410,6 +2410,46 @@ def _parse_device(s: str) -> str:
     return canonical
 
 
+_SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+_DATED_SLUG_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})-(.+)$")
+
+
+def _parse_slug(s: str) -> str:
+    if not _SLUG_RE.match(s):
+        raise argparse.ArgumentTypeError(
+            f"invalid --slug {s!r}: must be lowercase alphanumeric with "
+            f"single dashes (e.g. 'marple-pics')"
+        )
+    return s
+
+
+def resolve_slug_dest(dest_root: Path, slug: str, today: date) -> Path:
+    """Return <dest_root>/<date>-<slug>/, reusing an existing dated dir for
+    that slug if one exists; otherwise minted with today's date.
+
+    Date stays stable across re-runs so repeat imports with the same slug
+    land in the same directory. Errors if multiple dated dirs share the slug.
+    """
+    matches = []
+    if dest_root.is_dir():
+        for child in dest_root.iterdir():
+            if not child.is_dir():
+                continue
+            m = _DATED_SLUG_RE.match(child.name)
+            if m and m.group(2) == slug:
+                matches.append(child)
+    if len(matches) > 1:
+        listing = "\n".join(f"  {m}" for m in sorted(matches))
+        raise SystemExit(
+            f"media-import: multiple existing dirs match --slug {slug!r} "
+            f"under {dest_root}:\n{listing}\n"
+            f"  rename one or pass --dest explicitly."
+        )
+    if matches:
+        return matches[0]
+    return dest_root / f"{today.isoformat()}-{slug}"
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="media-import",
@@ -2420,7 +2460,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "Valid: auto, dji-mic-2, sony-a7c, dji-air-2 "
                         "(legacy aliases dji, sony still accepted with a warning)")
     p.add_argument("--dest", type=Path,
-                   help="Destination directory (required for actual runs)")
+                   help="Destination directory (required for actual runs). "
+                        "With --slug, treated as the parent root and the "
+                        "actual dest becomes <dest>/<date>-<slug>/.")
+    p.add_argument("--slug", type=_parse_slug,
+                   help="Append <date>-<slug>/ under --dest. Reuses an "
+                        "existing dated dir with that slug if present, "
+                        "otherwise mints one with today's date. Slug must "
+                        "be lowercase alnum with single dashes.")
     p.add_argument("--from", dest="from_date", type=parse_iso_date,
                    help="Earliest recording date (YYYY-MM-DD)")
     p.add_argument("--to", dest="to_date", type=parse_iso_date,
@@ -2529,6 +2576,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dest is None:
         parser.error("--dest is required")
+
+    if args.slug:
+        args.dest = resolve_slug_dest(args.dest, args.slug, date.today())
+        print(f"Resolved --slug {args.slug!r} to: {args.dest}", file=sys.stderr)
 
     # Device selection
     all_volumes = find_all_volumes()

@@ -1,6 +1,8 @@
 """Output-layout tests: <dest>/<date>/<device-class>/<tx>/<category>/."""
 
+import argparse
 import inspect
+import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
@@ -75,6 +77,94 @@ class TestTranscribeIdempotencyPath(unittest.TestCase):
             self.assertNotIn(bad, src,
                              f"Runner is using {bad!r}; transcripts must be "
                              "looked up under op.output_dir.")
+
+
+class TestParseSlug(unittest.TestCase):
+
+    def test_accepts_lowercase_with_dashes(self):
+        for ok in ("marple-pics", "summer-content", "tx01", "a", "a-b-c-d"):
+            self.assertEqual(dji._parse_slug(ok), ok)
+
+    def test_rejects_uppercase(self):
+        with self.assertRaises(argparse.ArgumentTypeError):
+            dji._parse_slug("Marple-Pics")
+
+    def test_rejects_spaces(self):
+        with self.assertRaises(argparse.ArgumentTypeError):
+            dji._parse_slug("marple pics")
+
+    def test_rejects_underscore(self):
+        with self.assertRaises(argparse.ArgumentTypeError):
+            dji._parse_slug("marple_pics")
+
+    def test_rejects_leading_or_trailing_dash(self):
+        with self.assertRaises(argparse.ArgumentTypeError):
+            dji._parse_slug("-marple")
+        with self.assertRaises(argparse.ArgumentTypeError):
+            dji._parse_slug("marple-")
+
+    def test_rejects_double_dash(self):
+        with self.assertRaises(argparse.ArgumentTypeError):
+            dji._parse_slug("marple--pics")
+
+    def test_rejects_empty(self):
+        with self.assertRaises(argparse.ArgumentTypeError):
+            dji._parse_slug("")
+
+
+class TestResolveSlugDest(unittest.TestCase):
+
+    def test_mints_with_today_when_no_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = dji.resolve_slug_dest(root, "marple-pics", date(2026, 5, 16))
+            self.assertEqual(out, root / "2026-05-16-marple-pics")
+
+    def test_reuses_existing_dated_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            existing = root / "2026-05-13-marple-pics"
+            existing.mkdir()
+            out = dji.resolve_slug_dest(root, "marple-pics", date(2026, 5, 16))
+            self.assertEqual(out, existing)
+
+    def test_ignores_other_slugs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "2026-05-13-other-shoot").mkdir()
+            (root / "2026-05-13-marple-pics").mkdir()
+            out = dji.resolve_slug_dest(root, "marple-pics", date(2026, 5, 16))
+            self.assertEqual(out, root / "2026-05-13-marple-pics")
+
+    def test_errors_on_multiple_matches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "2026-05-13-marple-pics").mkdir()
+            (root / "2026-04-01-marple-pics").mkdir()
+            with self.assertRaises(SystemExit) as ctx:
+                dji.resolve_slug_dest(root, "marple-pics", date(2026, 5, 16))
+            self.assertIn("marple-pics", str(ctx.exception))
+
+    def test_ignores_files_with_matching_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "2026-05-13-marple-pics").touch()  # file, not dir
+            out = dji.resolve_slug_dest(root, "marple-pics", date(2026, 5, 16))
+            self.assertEqual(out, root / "2026-05-16-marple-pics")
+
+    def test_handles_missing_root(self):
+        # Root doesn't exist yet; should mint with today (parent created later).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "not-yet-created"
+            out = dji.resolve_slug_dest(root, "marple-pics", date(2026, 5, 16))
+            self.assertEqual(out, root / "2026-05-16-marple-pics")
+
+    def test_ignores_undated_dirs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "marple-pics").mkdir()  # no date prefix
+            out = dji.resolve_slug_dest(root, "marple-pics", date(2026, 5, 16))
+            self.assertEqual(out, root / "2026-05-16-marple-pics")
 
 
 if __name__ == "__main__":
