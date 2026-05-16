@@ -27,7 +27,8 @@ _media-import() {
     '--dry-run[Preview only]' \
     '--verify-sony[Run Sony A7C real-card verification]' \
     '-h[Show help]' \
-    '--help[Show help]'
+    '--help[Show help]' \
+    '*::slug:'
 }
 
 # Return the value following the last occurrence of $1 in $words, or "".

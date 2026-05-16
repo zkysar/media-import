@@ -2417,7 +2417,7 @@ _DATED_SLUG_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})-(.+)$")
 def _parse_slug(s: str) -> str:
     if not _SLUG_RE.match(s):
         raise argparse.ArgumentTypeError(
-            f"invalid --slug {s!r}: must be lowercase alphanumeric with "
+            f"invalid slug {s!r}: must be lowercase alphanumeric with "
             f"single dashes (e.g. 'marple-pics')"
         )
     return s
@@ -2461,13 +2461,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "(legacy aliases dji, sony still accepted with a warning)")
     p.add_argument("--dest", type=Path,
                    help="Destination directory (required for actual runs). "
-                        "With --slug, treated as the parent root and the "
-                        "actual dest becomes <dest>/<date>-<slug>/.")
-    p.add_argument("--slug", type=_parse_slug,
-                   help="Append <date>-<slug>/ under --dest. Reuses an "
-                        "existing dated dir with that slug if present, "
-                        "otherwise mints one with today's date. Slug must "
-                        "be lowercase alnum with single dashes.")
+                        "With a trailing slug positional, treated as the "
+                        "parent root and actual dest becomes "
+                        "<dest>/<date>-<slug>/.")
+    p.add_argument("slug", nargs="?", type=_parse_slug,
+                   help="Optional slug. When given, --dest is treated as "
+                        "the parent root and the import lands in "
+                        "<dest>/<date>-<slug>/. Reuses an existing dated "
+                        "dir with that slug if present, otherwise mints "
+                        "one with today's date. Slug must be lowercase "
+                        "alnum with single dashes (e.g. 'marple-pics').")
     p.add_argument("--from", dest="from_date", type=parse_iso_date,
                    help="Earliest recording date (YYYY-MM-DD)")
     p.add_argument("--to", dest="to_date", type=parse_iso_date,
@@ -2579,7 +2582,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.slug:
         args.dest = resolve_slug_dest(args.dest, args.slug, date.today())
-        print(f"Resolved --slug {args.slug!r} to: {args.dest}", file=sys.stderr)
+        print(f"Resolved slug {args.slug!r} to: {args.dest}", file=sys.stderr)
 
     # Device selection
     all_volumes = find_all_volumes()
