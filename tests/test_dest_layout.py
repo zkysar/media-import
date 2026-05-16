@@ -2,7 +2,6 @@
 
 import argparse
 import inspect
-import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
@@ -112,59 +111,44 @@ class TestParseSlug(unittest.TestCase):
             dji._parse_slug("")
 
 
-class TestResolveSlugDest(unittest.TestCase):
+class TestEarliestShootDate(unittest.TestCase):
+    """Date proposed for <dest>/<date>-<slug>/ comes from media, not today."""
 
-    def test_mints_with_today_when_no_match(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            out = dji.resolve_slug_dest(root, "marple-pics", date(2026, 5, 16))
-            self.assertEqual(out, root / "2026-05-16-marple-pics")
+    def _chain(self, d: date):
+        # Minimal stand-in for build_chains output: only date_bucket is read.
+        class _C: pass
+        c = _C()
+        c.date_bucket = d
+        return c
 
-    def test_reuses_existing_dated_dir(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            existing = root / "2026-05-13-marple-pics"
-            existing.mkdir()
-            out = dji.resolve_slug_dest(root, "marple-pics", date(2026, 5, 16))
-            self.assertEqual(out, existing)
+    def _item(self, d: date):
+        # Minimal stand-in for MediaGroup: only .timestamp is read.
+        from datetime import datetime
+        class _G: pass
+        g = _G()
+        g.timestamp = datetime(d.year, d.month, d.day, 12, 0, 0)
+        return g
 
-    def test_ignores_other_slugs(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "2026-05-13-other-shoot").mkdir()
-            (root / "2026-05-13-marple-pics").mkdir()
-            out = dji.resolve_slug_dest(root, "marple-pics", date(2026, 5, 16))
-            self.assertEqual(out, root / "2026-05-13-marple-pics")
+    def test_returns_none_when_no_dates(self):
+        self.assertIsNone(dji._earliest_shoot_date([], []))
 
-    def test_errors_on_multiple_matches(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "2026-05-13-marple-pics").mkdir()
-            (root / "2026-04-01-marple-pics").mkdir()
-            with self.assertRaises(SystemExit) as ctx:
-                dji.resolve_slug_dest(root, "marple-pics", date(2026, 5, 16))
-            self.assertIn("marple-pics", str(ctx.exception))
+    def test_picks_min_across_mic_chains(self):
+        chains = [self._chain(date(2026, 5, 8)),
+                  self._chain(date(2026, 5, 7)),
+                  self._chain(date(2026, 5, 9))]
+        self.assertEqual(dji._earliest_shoot_date([], chains), date(2026, 5, 7))
 
-    def test_ignores_files_with_matching_name(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "2026-05-13-marple-pics").touch()  # file, not dir
-            out = dji.resolve_slug_dest(root, "marple-pics", date(2026, 5, 16))
-            self.assertEqual(out, root / "2026-05-16-marple-pics")
+    def test_picks_min_across_sony_drone_items(self):
+        items = [self._item(date(2026, 5, 8)),
+                 self._item(date(2026, 5, 7)),
+                 self._item(date(2026, 5, 9))]
+        self.assertEqual(dji._earliest_shoot_date(items, []),
+                         date(2026, 5, 7))
 
-    def test_handles_missing_root(self):
-        # Root doesn't exist yet; should mint with today (parent created later).
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "not-yet-created"
-            out = dji.resolve_slug_dest(root, "marple-pics", date(2026, 5, 16))
-            self.assertEqual(out, root / "2026-05-16-marple-pics")
-
-    def test_ignores_undated_dirs(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "marple-pics").mkdir()  # no date prefix
-            out = dji.resolve_slug_dest(root, "marple-pics", date(2026, 5, 16))
-            self.assertEqual(out, root / "2026-05-16-marple-pics")
+    def test_single_date_imports(self):
+        chains = [self._chain(date(2026, 5, 16))]
+        self.assertEqual(dji._earliest_shoot_date([], chains),
+                         date(2026, 5, 16))
 
 
 if __name__ == "__main__":

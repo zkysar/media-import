@@ -2411,7 +2411,6 @@ def _parse_device(s: str) -> str:
 
 
 _SLUG_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
-_DATED_SLUG_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})-(.+)$")
 
 
 def _parse_slug(s: str) -> str:
@@ -2423,31 +2422,53 @@ def _parse_slug(s: str) -> str:
     return s
 
 
-def resolve_slug_dest(dest_root: Path, slug: str, today: date) -> Path:
-    """Return <dest_root>/<date>-<slug>/, reusing an existing dated dir for
-    that slug if one exists; otherwise minted with today's date.
+def _earliest_shoot_date(items: list, chains: list) -> date | None:
+    """Earliest capture date across the items the user is about to import.
 
-    Date stays stable across re-runs so repeat imports with the same slug
-    land in the same directory. Errors if multiple dated dirs share the slug.
+    Mic uses chain.date_bucket (post-chain-detection); Sony/drone use the
+    MediaGroup.timestamp. None if nothing has a usable date.
     """
-    matches = []
-    if dest_root.is_dir():
-        for child in dest_root.iterdir():
-            if not child.is_dir():
-                continue
-            m = _DATED_SLUG_RE.match(child.name)
-            if m and m.group(2) == slug:
-                matches.append(child)
-    if len(matches) > 1:
-        listing = "\n".join(f"  {m}" for m in sorted(matches))
-        raise SystemExit(
-            f"media-import: multiple existing dirs match --slug {slug!r} "
-            f"under {dest_root}:\n{listing}\n"
-            f"  rename one or pass --dest explicitly."
-        )
-    if matches:
-        return matches[0]
-    return dest_root / f"{today.isoformat()}-{slug}"
+    candidates: list[date] = []
+    if chains:
+        candidates.extend(c.date_bucket for c in chains)
+    for it in items:
+        ts = getattr(it, "timestamp", None)
+        if ts is not None:
+            candidates.append(ts.date())
+    return min(candidates) if candidates else None
+
+
+def prompt_editable(prompt: str, default: str) -> str:
+    """Show a prompt with `default` pre-filled in the editable line buffer.
+
+    User can edit or press enter to accept verbatim. Returns whatever they
+    submit (stripped of trailing newline). On non-TTY, returns `default`
+    unchanged (so piped/cron runs match interactive enter-to-accept).
+    """
+    if not sys.stdin.isatty():
+        return default
+    try:
+        import readline
+    except ImportError:
+        # Fall back to bracketed default; enter-empty accepts.
+        try:
+            raw = input(f"{prompt}[{default}] ").strip()
+        except EOFError:
+            return default
+        return raw or default
+
+    def hook() -> None:
+        readline.insert_text(default)
+        readline.redisplay()
+
+    readline.set_startup_hook(hook)
+    try:
+        try:
+            return input(prompt)
+        except EOFError:
+            return default
+    finally:
+        readline.set_startup_hook(None)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2462,15 +2483,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dest", type=Path,
                    help="Destination directory (required for actual runs). "
                         "With a trailing slug positional, treated as the "
-                        "parent root and actual dest becomes "
-                        "<dest>/<date>-<slug>/.")
+                        "parent root and the proposed dest becomes "
+                        "<dest>/<earliest-shoot-date>-<slug>/.")
     p.add_argument("slug", nargs="?", type=_parse_slug,
-                   help="Optional slug. When given, --dest is treated as "
-                        "the parent root and the import lands in "
-                        "<dest>/<date>-<slug>/. Reuses an existing dated "
-                        "dir with that slug if present, otherwise mints "
-                        "one with today's date. Slug must be lowercase "
-                        "alnum with single dashes (e.g. 'marple-pics').")
+                   help="Optional slug. When given, the proposed dest is "
+                        "<dest>/<earliest-shoot-date>-<slug>/ where the "
+                        "date is read from the media's EXIF/filename "
+                        "after discovery. You'll be prompted to confirm "
+                        "or edit the path before the import runs. Slug "
+                        "must be lowercase alnum with single dashes "
+                        "(e.g. 'marple-pics').")
     p.add_argument("--from", dest="from_date", type=parse_iso_date,
                    help="Earliest recording date (YYYY-MM-DD)")
     p.add_argument("--to", dest="to_date", type=parse_iso_date,
@@ -2562,6 +2584,32 @@ def validate_whisper(model: str) -> None:
         )
 
 
+def _confirm_dest(args: argparse.Namespace, items: list, chains: list) -> Path:
+    """Single editable-prompt confirmation for the resolved dest path.
+
+    With a slug positional, proposes <dest>/<earliest-shoot-date>-<slug>/.
+    Without a slug, proposes --dest as-is. Either way the user can edit
+    the proposed path before pressing enter. Empty + enter aborts.
+    --yes skips the prompt and uses the proposal as-is.
+    """
+    if args.slug:
+        earliest = _earliest_shoot_date(items, chains)
+        if earliest is None:
+            sys.exit("media-import: no usable shoot dates found; cannot resolve slug.")
+        proposed = args.dest / f"{earliest.isoformat()}-{args.slug}"
+    else:
+        proposed = args.dest
+
+    if args.yes:
+        print(f"Dest: {proposed}", file=sys.stderr)
+        return proposed
+
+    chosen = prompt_editable("Dest: ", str(proposed)).strip()
+    if not chosen:
+        sys.exit("aborted.")
+    return Path(chosen).expanduser()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -2579,10 +2627,6 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.dest is None:
         parser.error("--dest is required")
-
-    if args.slug:
-        args.dest = resolve_slug_dest(args.dest, args.slug, date.today())
-        print(f"Resolved slug {args.slug!r} to: {args.dest}", file=sys.stderr)
 
     # Device selection
     all_volumes = find_all_volumes()
@@ -2602,13 +2646,12 @@ def main(argv: list[str] | None = None) -> int:
     if not relevant:
         sys.exit(f"media-import: no {device.name} card found.")
 
-    # Pre-scan confirmation
+    # Show what we found; discovery happens before the dest prompt so we
+    # have shoot dates to propose. (Discovery is read-only — no need to
+    # gate it behind a separate Y/N; the dest prompt is the single gate.)
     print(f"Found {device.name} on:", file=sys.stderr)
     for v in relevant:
         print(f"  {v}", file=sys.stderr)
-    pre_confirm = input("Proceed? [y/N] ").strip().lower()
-    if pre_confirm != "y":
-        sys.exit("aborted.")
 
     # Discovery and plan
     items_all = device.discover(relevant)
@@ -2627,6 +2670,7 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write("no clips matched the given filters.\n")
             return 0
         chains = build_chains(items)
+        args.dest = _confirm_dest(args, items, chains)
         plan = device.build_plan(chains, args)
     else:
         items = device.filter_by_args(items_all, args)
@@ -2635,6 +2679,7 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write("no media matched the given filters.\n")
             return 0
         chains = []
+        args.dest = _confirm_dest(args, items, chains)
         plan = device.build_plan(items, args)
 
     # Estimate
