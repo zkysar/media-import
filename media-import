@@ -819,9 +819,8 @@ def fmt_audio_duration(seconds: float) -> str:
     return f"{h}h {m:02d}m"
 
 
-def format_preview(plan: Plan, chains: list[Chain], volumes: list[Path],
-                    args: argparse.Namespace, est: dict,
-                    device: 'Device') -> str:
+def format_preview_body(plan: Plan, chains: list[Chain], volumes: list[Path],
+                        args: argparse.Namespace, device: 'Device') -> str:
     lines: list[str] = []
     lines.append(f"Import Preview ({device.name})")
     lines.append("─" * 64)
@@ -954,35 +953,69 @@ def format_preview(plan: Plan, chains: list[Chain], volumes: list[Path],
             lines.append(f"  {plan.dest}/{rel}/")
         except ValueError:
             lines.append(f"  {d}/")
-    lines.append("")
+    return "\n".join(lines)
 
-    # Time estimate
-    lines.append("Estimated time:")
-    lines.append(f"  Copy from SD:    {fmt_duration(est['copy']):>10}")
-    if plan.joins:
-        lines.append(f"  Join (concat):   {fmt_duration(est['join']):>10}")
-    if plan.singleton_moves:
-        lines.append(f"  Move singletons: {fmt_duration(est['move']):>10}")
-    if plan.transcribes:
-        lines.append(f"  Transcribe:      {fmt_duration(est['transcribe']):>10}")
+
+def _format_estimate_footer(prepped: list['PreparedImport']) -> list[str]:
+    """Aggregate per-device estimates into one 'Estimated time' block."""
+    copy_s = sum(p.est["copy"] for p in prepped)
+    join_s = sum(p.est["join"] for p in prepped)
+    move_s = sum(p.est["move"] for p in prepped)
+    trans_s = sum(p.est["transcribe"] for p in prepped)
+    total_s = copy_s + join_s + move_s + trans_s
+    first_run = any(p.est.get("first_run") for p in prepped)
+    any_joins = any(p.plan.joins for p in prepped)
+    any_moves = any(p.plan.singleton_moves for p in prepped)
+    any_trans = any(p.plan.transcribes for p in prepped)
+
+    lines = ["Estimated time:"]
+    lines.append(f"  Copy from SD:    {fmt_duration(copy_s):>10}")
+    if any_joins:
+        lines.append(f"  Join (concat):   {fmt_duration(join_s):>10}")
+    if any_moves:
+        lines.append(f"  Move singletons: {fmt_duration(move_s):>10}")
+    if any_trans:
+        lines.append(f"  Transcribe:      {fmt_duration(trans_s):>10}")
     lines.append("  " + "─" * 36)
-    note = "  (defaults — actual hardware not benchmarked yet)" if est["first_run"] else ""
-    lines.append(f"  Total:           {fmt_duration(est['total']):>10}{note}")
-    lines.append("")
+    note = "  (defaults — actual hardware not benchmarked yet)" if first_run else ""
+    lines.append(f"  Total:           {fmt_duration(total_s):>10}{note}")
+    return lines
 
-    # Disk space
-    peak, joined_bytes, singleton_bytes = peak_required_bytes(plan)
-    free = free_bytes_at(plan.dest)
+
+def _format_space_footer(prepped: list['PreparedImport'], dest: Path) -> list[str]:
+    """Aggregate per-device peaks into one 'Disk space' block, single free read.
+
+    Summing per-device peaks is conservative: devices run sequentially, so true
+    peak is lower. Conservative is the safe direction for a pre-flight check."""
+    peak = joined = singleton = 0
+    for p in prepped:
+        pk, jb, sb = peak_required_bytes(p.plan)
+        peak += pk
+        joined += jb
+        singleton += sb
+    free = free_bytes_at(dest)
     headroom = free - peak
     headroom_str = fmt_size(headroom) if headroom >= 0 else "-" + fmt_size(-headroom)
-    lines.append(f"Disk space at dest: ~{fmt_size(joined_bytes + singleton_bytes)}")
+    lines = [f"Disk space at dest: ~{fmt_size(joined + singleton)}"]
     lines.append("  (joined files + singletons; chain members staged in temp during join, then removed)")
     lines.append(f"  Required peak:   {fmt_size(peak)}")
     lines.append(f"  Free at dest:    {fmt_size(free)}")
     lines.append(f"  Headroom:        {headroom_str}")
     if headroom < 0:
         lines.append(f"  ⚠ INSUFFICIENT SPACE — short by {fmt_size(-headroom)}")
-    return "\n".join(lines)
+    return lines
+
+
+def format_combined_preview(prepped: list['PreparedImport'],
+                            args: argparse.Namespace) -> str:
+    """One preview: each device's body block, then a single shared footer."""
+    blocks = [
+        format_preview_body(p.plan, p.chains, p.volumes, args, p.device)
+        for p in prepped
+    ]
+    footer = _format_estimate_footer(prepped) + [""] + \
+        _format_space_footer(prepped, args.dest)
+    return "\n\n".join(blocks) + "\n\n" + "\n".join(footer)
 
 
 # ───────────────────────── progress UI ─────────────────────────
@@ -2729,7 +2762,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # Preview
     clear_status()
-    print(format_preview(plan, chains, relevant, args, est, device))
+    _prepared = PreparedImport(device, relevant, items, chains, plan, est)
+    print(format_combined_preview([_prepared], args))
     print()
 
     if args.dry_run:
