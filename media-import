@@ -2141,6 +2141,11 @@ DJI_AIR_2 = Device(
 ALL_DEVICES: list[Device] = [DJI_MIC, SONY_A7C, DJI_AIR_2]
 
 
+def _sony_is_verified() -> bool:
+    """True if the one-time Sony real-card verification has been completed."""
+    return SONY_VERIFICATION_PATH.exists()
+
+
 def _check_sony_verification() -> None:
     if not SONY_VERIFICATION_PATH.exists():
         sys.exit(
