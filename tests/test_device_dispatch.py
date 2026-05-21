@@ -82,6 +82,34 @@ class DeviceDispatchTest(unittest.TestCase):
             (vol / "junk.txt").write_bytes(b"")
             self.assertFalse(m._sony_volume_detect(vol))
 
+    def test_select_devices_auto_returns_both_when_both_present(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as t1, tempfile.TemporaryDirectory() as t2:
+            mic = Path(t1)
+            (mic / "TX01_MIC001_20260503_120000_orig.wav").write_bytes(b"")
+            sony = Path(t2)
+            stills = sony / "DCIM" / "100MSDCF"
+            stills.mkdir(parents=True)
+            (stills / "DSC00001.JPG").write_bytes(b"")
+            picked = m.select_devices([mic, sony], requested="auto")
+            # ALL_DEVICES order: DJI_MIC, SONY_A7C, DJI_AIR_2
+            self.assertEqual(picked, [m.DJI_MIC, m.SONY_A7C])
+
+    def test_select_devices_explicit_returns_single(self):
+        self.assertEqual(m.select_devices([], requested="sony-a7c"), [m.SONY_A7C])
+
+    def test_select_devices_auto_none_present_exits(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            vol = Path(tmp)
+            (vol / "junk.txt").write_bytes(b"")
+            with self.assertRaises(SystemExit):
+                m.select_devices([vol], requested="auto")
+
+    def test_select_devices_unknown_name_exits(self):
+        with self.assertRaises(SystemExit):
+            m.select_devices([], requested="not-a-real-device")
+
 
 if __name__ == "__main__":
     unittest.main()

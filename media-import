@@ -2136,7 +2136,7 @@ DJI_AIR_2 = Device(
 )
 
 
-# Ordered registry consulted by select_device. New devices append here.
+# Ordered registry consulted by select_devices. New devices append here.
 # Order is the auto-detect priority — earlier devices win ties (none today).
 ALL_DEVICES: list[Device] = [DJI_MIC, SONY_A7C, DJI_AIR_2]
 
@@ -2219,8 +2219,12 @@ def cmd_verify_sony() -> int:
     return 0
 
 
-def select_device(volumes: list[Path], requested: str) -> Device:
-    """Pick a Device by --device flag value or auto-detect across volumes.
+def select_devices(volumes: list[Path], requested: str) -> list[Device]:
+    """All devices to import this run, in ALL_DEVICES order.
+
+    Explicit --device → exactly that one device. 'auto' → every device with
+    at least one matching volume. Exits (same messages as before) on an
+    unknown name or when auto-detect finds nothing.
 
     `requested` is canonical (model-specific). Aliases are handled at parse
     time by `_parse_device`.
@@ -2228,17 +2232,22 @@ def select_device(volumes: list[Path], requested: str) -> Device:
     if requested != "auto":
         for d in ALL_DEVICES:
             if requested == d.name:
-                return d
+                return [d]
         valid = ", ".join(d.name for d in ALL_DEVICES)
         sys.exit(f"media-import: unknown device {requested!r}; "
                  f"valid: auto, {valid}")
-    for vol in volumes:
-        for d in ALL_DEVICES:
-            if d.detect(vol):
-                return d
-    valid = ", ".join(d.name for d in ALL_DEVICES)
-    sys.exit(f"media-import: no recognized media device on any mounted volume. "
-             f"Pass --device <{valid}> explicitly.")
+    found = [d for d in ALL_DEVICES if any(d.detect(v) for v in volumes)]
+    if not found:
+        valid = ", ".join(d.name for d in ALL_DEVICES)
+        sys.exit(f"media-import: no recognized media device on any mounted volume. "
+                 f"Pass --device <{valid}> explicitly.")
+    assert found  # invariant: select_devices never returns an empty list
+    return found
+
+
+def select_device(volumes: list[Path], requested: str) -> Device:
+    """First of select_devices; for callers that need a single device. Exits (via select_devices) on no match."""
+    return select_devices(volumes, requested)[0]
 
 
 # ───────────────────────── completion dispatch ─────────────────────────
