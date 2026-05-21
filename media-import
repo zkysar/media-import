@@ -251,6 +251,22 @@ class Device:
     completion_dates: Callable[[list[Path]], list[date]]
 
 
+@dataclass
+class PreparedImport:
+    """One device's import, prepared for a combined run.
+
+    Single-device runs are the N=1 case. `chains` is mic-only ([] otherwise);
+    `items` holds the filtered Clip/MediaGroup list. `plan` and `est` are
+    filled after the shared dest is confirmed.
+    """
+    device: Device
+    volumes: list[Path]
+    items: list
+    chains: list
+    plan: Plan
+    est: dict
+
+
 # ─────────────────────────── helpers ────────────────────────────
 
 def require_exiftool() -> None:

@@ -55,5 +55,18 @@ class ResolveDateRangeTest(unittest.TestCase):
             m.resolve_date_range(args, [])
 
 
+class PreparedImportTest(unittest.TestCase):
+    def test_fields_and_defaults(self):
+        p = m.PreparedImport(
+            device=m.DJI_MIC, volumes=[Path("/v")], items=[], chains=[],
+            plan=m.Plan(), est={})
+        self.assertIs(p.device, m.DJI_MIC)
+        self.assertEqual(p.volumes, [Path("/v")])
+        self.assertEqual(p.items, [])
+        self.assertEqual(p.chains, [])
+        self.assertIsInstance(p.plan, m.Plan)
+        self.assertEqual(p.est, {})
+
+
 if __name__ == "__main__":
     unittest.main()
