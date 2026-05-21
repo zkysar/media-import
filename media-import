@@ -2523,8 +2523,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def resolve_date_range(args: argparse.Namespace,
-                        clips_for_default: list[Clip]) -> None:
-    """Mutate args to fill in from_date/to_date."""
+                       default_dates: list[date]) -> None:
+    """Mutate args to fill in from_date/to_date.
+
+    `default_dates` are the capture dates used only to infer `from_date` when
+    neither --from nor --days is given (earliest capture across all devices).
+    """
     if args.days is not None:
         if args.from_date or args.to_date:
             raise SystemExit("--days is mutually exclusive with --from/--to")
@@ -2535,11 +2539,26 @@ def resolve_date_range(args: argparse.Namespace,
     if args.to_date is None:
         args.to_date = date.today()
     if args.from_date is None:
-        if not clips_for_default:
+        if not default_dates:
             raise SystemExit(
-                "no clips found on connected mics; specify --from explicitly"
+                "no media found on connected volumes; specify --from explicitly"
             )
-        args.from_date = min(c.start.date() for c in clips_for_default)
+        args.from_date = min(default_dates)
+
+
+def _range_default_dates(discovered: list[tuple['Device', list[Path], list]]) -> list[date]:
+    """Capture dates across every device's pre-filter items, for range inference.
+
+    Mic items are `Clip` (use .start); group devices are `MediaGroup`
+    (use .timestamp)."""
+    dates: list[date] = []
+    for device, _relevant, items_all in discovered:
+        for it in items_all:
+            if device is DJI_MIC:
+                dates.append(it.start.date())
+            else:
+                dates.append(it.timestamp.date())
+    return dates
 
 
 def confirm(prompt: str) -> bool:
