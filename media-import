@@ -2699,84 +2699,97 @@ def main(argv: list[str] | None = None) -> int:
     if args.dest is None:
         parser.error("--dest is required")
 
-    # Device selection
+    # Device selection — every detected device (auto) or the one requested.
     all_volumes = find_all_volumes()
-    device = select_device(all_volumes, requested=args.device)
+    devices = select_devices(all_volumes, requested=args.device)
 
-    if args.transcribe and not device.supports_transcribe:
+    # --transcribe is meaningful only if at least one selected device supports it.
+    if args.transcribe and not any(d.supports_transcribe for d in devices):
+        names = ", ".join(d.name for d in devices)
         sys.exit(
-            f"media-import: --transcribe is not supported for device {device.name}.\n"
+            f"media-import: --transcribe is not supported for {names}.\n"
             f"  (drone footage etc. — pass without --transcribe.)"
         )
 
-    if device is SONY_A7C:
-        require_exiftool()
-        _check_sony_verification()
-
-    relevant = [v for v in all_volumes if device.detect(v)]
-    if not relevant:
-        sys.exit(f"media-import: no {device.name} card found.")
-
-    # Show what we found; discovery happens before the dest prompt so we
-    # have shoot dates to propose. (Discovery is read-only — no need to
-    # gate it behind a separate Y/N; the dest prompt is the single gate.)
-    print(f"Found {device.name} on:", file=sys.stderr)
-    for v in relevant:
-        print(f"  {v}", file=sys.stderr)
-
-    # Discovery and plan
-    items_all = device.discover(relevant)
-
-    if device is DJI_MIC:
-        # DJI-specific: resolve date range defaults from ALL clips before
-        # filtering, then chain-detect between discover and build_plan.
+    # Phase 1: per-device read-only discovery. Drop non-viable devices with a
+    # note rather than aborting a ready device.
+    discovered: list[tuple[Device, list[Path], list]] = []
+    for device in devices:
+        if device is SONY_A7C and not _sony_is_verified():
+            sys.stderr.write(
+                "media-import: skipping Sony A7C — not verified.\n"
+                "  Run `media-import --verify-sony` first to enable it.\n"
+            )
+            continue
+        relevant = [v for v in all_volumes if device.detect(v)]
+        if not relevant:
+            continue
+        if device is SONY_A7C:
+            require_exiftool()
+        print(f"Found {device.name} on:", file=sys.stderr)
+        for v in relevant:
+            print(f"  {v}", file=sys.stderr)
+        items_all = device.discover(relevant)
         if not items_all:
-            clear_status()
-            sys.stderr.write("error: connected volumes have no DJI files matching pattern.\n")
-            return 2
-        resolve_date_range(args, items_all)
-        items = device.filter_by_args(items_all, args)
-        if not items:
-            clear_status()
-            sys.stderr.write("no clips matched the given filters.\n")
-            return 0
-        chains = build_chains(items)
-        args.dest = _confirm_dest(args, items, chains)
-        plan = device.build_plan(chains, args)
-    else:
-        items = device.filter_by_args(items_all, args)
-        if not items:
-            clear_status()
-            sys.stderr.write("no media matched the given filters.\n")
-            return 0
-        chains = []
-        args.dest = _confirm_dest(args, items, chains)
-        plan = device.build_plan(items, args)
+            sys.stderr.write(f"  (no {device.name} files matched; skipping)\n")
+            continue
+        discovered.append((device, relevant, items_all))
 
-    # Estimate
+    if not discovered:
+        clear_status()
+        sys.stderr.write("error: no importable media on connected volumes.\n")
+        return 2
+
+    # Phase 2: one date range across all devices' pre-filter items.
+    resolve_date_range(args, _range_default_dates(discovered))
+
+    # Phase 3: filter + chain-detect per device. Drop devices that filter empty.
+    prepped: list[PreparedImport] = []
+    union_items: list = []
+    union_chains: list = []
+    for device, relevant, items_all in discovered:
+        items = device.filter_by_args(items_all, args)
+        if not items:
+            continue
+        chains = build_chains(items) if device is DJI_MIC else []
+        prepped.append(PreparedImport(device, relevant, items, chains, Plan(), {}))
+        union_items.extend(items)
+        union_chains.extend(chains)
+
+    if not prepped:
+        clear_status()
+        sys.stderr.write("no media matched the given filters.\n")
+        return 0
+
+    # Phase 4: one dest prompt across the union of all devices.
+    args.dest = _confirm_dest(args, union_items, union_chains)
+
+    # Phase 5: build plans + estimates per device against the shared dest.
     rates = load_rates()
     first_run = not RATE_CACHE_PATH.exists()
-    est = estimate_seconds(plan, rates,
-                            args.model if args.transcribe else None,
-                            first_run)
+    for p in prepped:
+        plan_input = p.chains if p.device is DJI_MIC else p.items
+        p.plan = p.device.build_plan(plan_input, args)
+        model = args.model if (args.transcribe and p.device.supports_transcribe) else None
+        p.est = estimate_seconds(p.plan, rates, model, first_run)
 
-    # Preview
+    # Phase 6: one combined preview.
     clear_status()
-    _prepared = PreparedImport(device, relevant, items, chains, plan, est)
-    print(format_combined_preview([_prepared], args))
+    print(format_combined_preview(prepped, args))
     print()
 
     if args.dry_run:
         print("(dry run — nothing executed)")
         return 0
 
-    peak, _, _ = peak_required_bytes(plan)
-    free = free_bytes_at(plan.dest)
-    if peak > free:
+    # Combined free-space check (single dest, summed peaks).
+    total_peak = sum(peak_required_bytes(p.plan)[0] for p in prepped)
+    free = free_bytes_at(args.dest)
+    if total_peak > free:
         sys.stderr.write(
-            f"error: insufficient free space at {plan.dest}: "
-            f"need {fmt_size(peak)}, have {fmt_size(free)}, "
-            f"short by {fmt_size(peak - free)}.\n"
+            f"error: insufficient free space at {args.dest}: "
+            f"need {fmt_size(total_peak)}, have {fmt_size(free)}, "
+            f"short by {fmt_size(total_peak - free)}.\n"
         )
         return 4
 
@@ -2785,14 +2798,30 @@ def main(argv: list[str] | None = None) -> int:
             print("aborted.")
             return 1
 
-    # Execute
+    # Phase 7: execute each device's plan in sequence. Idempotent staging means
+    # a failure after an earlier device finished leaves that output intact and a
+    # re-run skips it.
     overall_t0 = time.monotonic()
+    total_joins = 0
+    total_moves = 0
+    total_skipped = 0
+    total_overwritten = 0
+    total_transcripts = 0
+    trans_failures: list = []
+    total_est = sum(p.est["total"] for p in prepped)
     try:
-        copy_stats = run_copies(plan, rates)
-        join_stats = run_joins(plan, rates)
-        move_stats = run_singleton_moves(plan)
-        run_audio_extracts(plan)   # extract video audio for any scheduled transcribe ops
-        trans_stats = run_transcribes(plan, args, rates)
+        for p in prepped:
+            run_copies(p.plan, rates)
+            run_joins(p.plan, rates)
+            move_stats = run_singleton_moves(p.plan)
+            run_audio_extracts(p.plan)
+            trans_stats = run_transcribes(p.plan, args, rates)
+            total_joins += len(p.plan.joins)
+            total_moves += move_stats.get("count", 0)
+            total_skipped += move_stats.get("skipped", 0)
+            total_overwritten += move_stats.get("overwritten", 0)
+            total_transcripts += trans_stats.get("count", 0)
+            trans_failures.extend(trans_stats.get("failures", []))
     except KeyboardInterrupt:
         print("\ninterrupted; staging left intact for resume on next run.")
         return 130
@@ -2800,33 +2829,28 @@ def main(argv: list[str] | None = None) -> int:
         print(f"\nerror: {e}")
         return 3
 
-    cleanup_staging(plan)
+    for p in prepped:
+        cleanup_staging(p.plan)
     save_rates(rates)
 
     elapsed = time.monotonic() - overall_t0
     print()
-    print(f"Done in {fmt_duration(elapsed)} (estimated {fmt_duration(est['total'])}).")
-    print(f"  Joined files: {len(plan.joins)}")
-    overwritten = move_stats.get("overwritten", 0)
-    overwrite_str = f", overwrote {overwritten}" if overwritten else ""
-    print(f"  Singletons:   {move_stats.get('count', 0)} "
-          f"(skipped {move_stats.get('skipped', 0)}{overwrite_str})")
-    if plan.transcribes:
-        x_realtime = (trans_stats["audio_s"] / max(0.1, trans_stats["elapsed"] - 10.0)
-                      if trans_stats["elapsed"] > 10 else 0.0)
-        print(f"  Transcripts:  {trans_stats['count']} "
-              f"({fmt_audio_duration(trans_stats['audio_s'])} audio · "
-              f"{fmt_duration(trans_stats['elapsed'])} wall · "
-              f"{x_realtime:.1f}× realtime)")
-    if trans_stats.get("failures"):
-        print(f"  Transcribe failures: {len(trans_stats['failures'])}")
-        for path, err in trans_stats["failures"][:3]:
+    print(f"Done in {fmt_duration(elapsed)} (estimated {fmt_duration(total_est)}).")
+    print(f"  Joined files: {total_joins}")
+    overwrite_str = f", overwrote {total_overwritten}" if total_overwritten else ""
+    print(f"  Singletons:   {total_moves} (skipped {total_skipped}{overwrite_str})")
+    if total_transcripts:
+        print(f"  Transcripts:  {total_transcripts}")
+    if trans_failures:
+        print(f"  Transcribe failures: {len(trans_failures)}")
+        for path, err in trans_failures[:3]:
             print(f"    {path.name}: {err[:120]}")
 
     if args.eject:
+        all_relevant = sorted({v for p in prepped for v in p.volumes})
         print()
         print("Ejecting source volumes:")
-        try_eject_volumes(relevant)
+        try_eject_volumes(all_relevant)
 
     return 0
 
