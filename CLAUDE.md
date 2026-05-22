@@ -33,6 +33,8 @@ The script holds a `Device` dataclass with hooks (`detect`, `discover`, `filter_
 
 `ALL_DEVICES` is the ordered registry consulted by `select_device`. To add a fourth device: implement the hooks, build a `Device` instance, append it to `ALL_DEVICES`. `select_device`, `--device` parsing, and `cmd_complete` derive their behavior from the registry.
 
+`select_devices` (the list form) returns every device detected when `--device auto`, in `ALL_DEVICES` order; an explicit `--device` returns just that one. `main()` imports them all in a single run: per-device read-only discovery, one shared dest prompt, one combined preview (each device's body block + a single aggregated time/disk-space footer), one Proceed gate, then each device's plan executed in sequence. Single-device is the N=1 case of the same path. A device that is non-viable (unverified Sony, or zero items after filtering) is dropped with a stderr note rather than aborting the others; the run only errors when nothing is left to import. `select_device` (singular) remains as a thin wrapper for completion dispatch.
+
 `--device` accepts model-specific names (`dji-mic-2`, `sony-a7c`, `dji-air-2`) plus `auto`. Legacy aliases `dji` and `sony` are mapped at parse time with a stderr deprecation warning via `_DEVICE_ALIASES` / `_parse_device`. `select_device` only ever sees canonical names.
 
 `Device.supports_transcribe` controls whether `--transcribe` is meaningful. Drone is False (audio is wind/motor); mic and Sony are True. The CLI rejects `--transcribe` at dispatch for unsupporting devices — no per-device branching inside `build_plan`.
