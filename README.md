@@ -111,6 +111,14 @@ The flag is rejected for `--device dji-air-2` at dispatch time.
 **Known quirk:** MP4 timestamps come from QuickTime `CreateDate` (UTC). Clips
 shot near a UTC day boundary may bucket into the "wrong" local date.
 
+## Multiple devices at once
+
+If you plug in more than one device type (e.g. a Sony A7C card and a DJI Mic
+transmitter), `auto` detects and imports them all in a single run. Everything
+lands under one `--dest`, separated by device class (`RAW/<date>/SONY-A7C/`,
+`RAW/<date>/DJI-MICS/`, ...). You get one preview and one confirmation covering
+all of them.
+
 ## Overwrite handling
 
 For all devices, the preview lists any files that would replace existing
