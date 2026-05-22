@@ -179,5 +179,157 @@ class MainMultiDeviceTest(unittest.TestCase):
         self.assertIn("(dry run — nothing executed)", out)
 
 
+class EmptyAfterFilterTest(unittest.TestCase):
+    def setUp(self):
+        self._orig_find = m.find_all_volumes
+        self._orig_validate = m.validate_runtime
+        self._orig_dd = m.DJI_AIR_2.detect
+        self._orig_disc = m.DJI_AIR_2.discover
+        m.validate_runtime = lambda: None
+
+    def tearDown(self):
+        m.find_all_volumes = self._orig_find
+        m.validate_runtime = self._orig_validate
+        m.DJI_AIR_2.detect = self._orig_dd
+        m.DJI_AIR_2.discover = self._orig_disc
+
+    def test_all_items_filtered_out_returns_0_no_media(self):
+        drone_vol = Path("/Volumes/DRONE")
+        # Capture dated 2026-05-03. Today is 2026-05-22 so --days 1 sets
+        # from_date=2026-05-21; dji_air_filter_by_args drops this group.
+        drone_g = m.MediaGroup(
+            kind="video",
+            primary=drone_vol / "DCIM/100MEDIA/DJI_0001.MP4",
+            files=[drone_vol / "DCIM/100MEDIA/DJI_0001.MP4"],
+            timestamp=datetime(2026, 5, 3, 10, 0, 0),
+            body_serial="UNKNOWN", size_bytes=2000, volume=drone_vol)
+        m.find_all_volumes = lambda: [drone_vol]
+        m.DJI_AIR_2.detect = lambda v: v == drone_vol
+        m.DJI_AIR_2.discover = lambda vols: [drone_g]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = m.main(["--dest", tmp, "--device", "auto",
+                             "--days", "1", "--yes", "--dry-run"])
+            stderr = err.getvalue()
+        self.assertEqual(rc, 0)
+        self.assertIn("no media matched the given filters", stderr)
+
+
+class TwoDeviceExecutionTest(unittest.TestCase):
+    """Drive main() through Phase 7 (real execution, no --dry-run) for mic +
+    drone. Asserts both devices' files land under the dest tree and that the
+    Done/Singletons summary prints."""
+
+    def setUp(self):
+        self._orig = {
+            "find": m.find_all_volumes,
+            "validate": m.validate_runtime,
+            "mic_detect": m.DJI_MIC.detect,
+            "mic_disc": m.DJI_MIC.discover,
+            "drone_detect": m.DJI_AIR_2.detect,
+            "drone_disc": m.DJI_AIR_2.discover,
+        }
+        m.validate_runtime = lambda: None
+
+    def tearDown(self):
+        m.find_all_volumes = self._orig["find"]
+        m.validate_runtime = self._orig["validate"]
+        m.DJI_MIC.detect = self._orig["mic_detect"]
+        m.DJI_MIC.discover = self._orig["mic_disc"]
+        m.DJI_AIR_2.detect = self._orig["drone_detect"]
+        m.DJI_AIR_2.discover = self._orig["drone_disc"]
+
+    def test_real_execution_both_devices_files_land(self):
+        with tempfile.TemporaryDirectory() as srcdir:
+            src = Path(srcdir)
+
+            # --- Mic source file ---
+            # A real .wav file is required: Clip.size_bytes stats the path,
+            # and run_copies does shutil.copy2(src, staging).
+            # We write a minimal valid WAV (44-byte header + silence) so
+            # the file exists and has non-zero size.
+            mic_vol = src / "MIC"
+            mic_vol.mkdir()
+            mic_fname = "TX01_MIC001_20260503_120000_orig.wav"
+            mic_src = mic_vol / mic_fname
+            # 44-byte PCM WAV header for 1 second of mono 16-bit 8000 Hz silence.
+            import struct
+            sample_rate, channels, bits = 8000, 1, 16
+            n_samples = sample_rate  # 1 second
+            data_size = n_samples * channels * (bits // 8)
+            block_align = channels * (bits // 8)
+            byte_rate = sample_rate * block_align
+            header = struct.pack(
+                "<4sI4s4sIHHIIHH4sI",
+                b"RIFF", 36 + data_size, b"WAVE",
+                b"fmt ", 16, 1, channels, sample_rate, byte_rate,
+                block_align, bits,
+                b"data", data_size,
+            )
+            mic_src.write_bytes(header + bytes(data_size))
+
+            # Clip fields: path, tx, clip_idx, start, version, wav, volume.
+            # Wav: fmt_code, channels, sample_rate, block_align, bits_per_sample,
+            #      data_offset, data_size.
+            clip = m.Clip(
+                path=mic_src,
+                tx="TX01", clip_idx=1,
+                start=datetime(2026, 5, 3, 12, 0, 0),
+                version="orig",
+                wav=m.Wav(1, channels, sample_rate, block_align, bits, 44, data_size),
+                volume=mic_vol)
+
+            # --- Drone source file ---
+            # dji_air_build_plan stats each src file; run_copies does shutil.copy2.
+            drone_vol = src / "DRONE"
+            drone_media = drone_vol / "DCIM" / "100MEDIA"
+            drone_media.mkdir(parents=True)
+            drone_fname = "DJI_0001.MP4"
+            drone_src = drone_media / drone_fname
+            drone_src.write_bytes(b"\x00" * 1024)
+
+            drone_g = m.MediaGroup(
+                kind="video",
+                primary=drone_src,
+                files=[drone_src],
+                timestamp=datetime(2026, 5, 3, 10, 0, 0),
+                body_serial="UNKNOWN", size_bytes=1024, volume=drone_vol)
+
+            m.find_all_volumes = lambda: [mic_vol, drone_vol]
+            m.DJI_MIC.detect = lambda v: v == mic_vol
+            m.DJI_MIC.discover = lambda vols: [clip]
+            m.DJI_AIR_2.detect = lambda v: v == drone_vol
+            m.DJI_AIR_2.discover = lambda vols: [drone_g]
+
+            with tempfile.TemporaryDirectory() as dest:
+                dest_path = Path(dest)
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    rc = m.main(["--dest", dest, "--device", "auto",
+                                 "--days", "3650", "--yes"])
+                stdout = out.getvalue()
+
+                # rc == 0 means Phase 7 completed without error.
+                self.assertEqual(rc, 0)
+
+                # Mic singleton: <dest>/RAW/2026-05-03/DJI-MICS/TX01/ORIG/<fname>
+                # Confirmed by dest_dir_for(dest, date(2026,5,3), "TX01", "orig")
+                # → dest/RAW/2026-05-03/DJI-MICS/TX01/ORIG/
+                mic_out = dest_path / "RAW" / "2026-05-03" / "DJI-MICS" / "TX01" / "ORIG" / mic_fname
+                self.assertTrue(mic_out.exists(), f"Mic output missing: {mic_out}")
+
+                # Drone video: <dest>/RAW/2026-05-03/DJI-DRONES/VIDEOS/<fname>
+                # Confirmed by _dji_air_dest_dir_for(dest, date(2026,5,3), "video")
+                # → dest/RAW/2026-05-03/DJI-DRONES/VIDEOS/
+                drone_out = dest_path / "RAW" / "2026-05-03" / "DJI-DRONES" / "VIDEOS" / drone_fname
+                self.assertTrue(drone_out.exists(), f"Drone output missing: {drone_out}")
+
+                # Summary line from main() phase 7 output.
+                self.assertIn("Done in", stdout)
+                self.assertIn("Singletons:", stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

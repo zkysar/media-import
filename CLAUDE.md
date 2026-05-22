@@ -31,7 +31,7 @@ Example (drone): `~/Drone/2026-05/RAW/2026-05-07/DJI-DRONES/VIDEOS/DJI_0014.MP4`
 
 The script holds a `Device` dataclass with hooks (`detect`, `discover`, `filter_by_args`, `build_plan`, `completion_dates`) plus a `supports_transcribe: bool` flag. Three instances exist: `DJI_MIC`, `SONY_A7C`, `DJI_AIR_2`.
 
-`ALL_DEVICES` is the ordered registry consulted by `select_device`. To add a fourth device: implement the hooks, build a `Device` instance, append it to `ALL_DEVICES`. `select_device`, `--device` parsing, and `cmd_complete` derive their behavior from the registry.
+`ALL_DEVICES` is the ordered registry consulted by `select_devices`. To add a fourth device: implement the hooks, build a `Device` instance, append it to `ALL_DEVICES`. `select_device`, `--device` parsing, and `cmd_complete` derive their behavior from the registry.
 
 `select_devices` (the list form) returns every device detected when `--device auto`, in `ALL_DEVICES` order; an explicit `--device` returns just that one. `main()` imports them all in a single run: per-device read-only discovery, one shared dest prompt, one combined preview (each device's body block + a single aggregated time/disk-space footer), one Proceed gate, then each device's plan executed in sequence. Single-device is the N=1 case of the same path. A device that is non-viable (unverified Sony, or zero items after filtering) is dropped with a stderr note rather than aborting the others; the run only errors when nothing is left to import. `select_device` (singular) remains as a thin wrapper for completion dispatch.
 
