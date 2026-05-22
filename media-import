@@ -2195,18 +2195,6 @@ def _sony_is_verified() -> bool:
     return SONY_VERIFICATION_PATH.exists()
 
 
-def _check_sony_verification() -> None:
-    if not SONY_VERIFICATION_PATH.exists():
-        sys.exit(
-            "media-import: Sony A7C import is gated behind a one-time real-card\n"
-            "verification step.\n"
-            "  1. Insert your Sony A7C SD card.\n"
-            "  2. Run: media-import --verify-sony\n"
-            "  3. Confirm the scan output looks correct.\n"
-            "After that, normal `--device sony` invocations will work."
-        )
-
-
 def cmd_verify_sony() -> int:
     require_exiftool()
     all_volumes = find_all_volumes()
